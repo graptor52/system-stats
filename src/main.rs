@@ -376,6 +376,38 @@ struct Notice {
 
 const NOTICE_TTL: Duration = Duration::from_secs(6);
 
+// Panic button: three Escs within ESC_BURST_WINDOW, from anywhere — a
+// detail view, a nested menu, the action editor — jump straight back to
+// the git status tab with the tab bar focused. Single Escs keep their
+// usual one-level-up meaning; any other key breaks the run, so a slow
+// Esc / arrow / Esc / Esc sequence isn't mistaken for a burst.
+const ESC_BURST_COUNT: usize = 3;
+const ESC_BURST_WINDOW: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct EscBurst {
+    presses: Vec<Instant>,
+}
+
+impl EscBurst {
+    // Record an Esc at `now`. Returns true when this press completes a
+    // burst (and clears the run so the next Esc starts fresh).
+    fn press(&mut self, now: Instant) -> bool {
+        self.presses.retain(|&t| now.duration_since(t) <= ESC_BURST_WINDOW);
+        self.presses.push(now);
+        if self.presses.len() >= ESC_BURST_COUNT {
+            self.presses.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset(&mut self) {
+        self.presses.clear();
+    }
+}
+
 // Shown when every terminal launcher failed to even start. On Linux that
 // means none of the emulators we know are installed, which $TERMINAL can
 // fix; on macOS it takes an osascript that won't run, which nothing here
@@ -483,6 +515,8 @@ struct App {
     // every launch (never persisted, so it follows the user across
     // terminal apps). None under tmux or editor-embedded terminals.
     terminal: Option<config::TerminalApp>,
+    // Recent Esc presses, for the triple-Esc "take me home" shortcut.
+    esc_burst: EscBurst,
     should_quit: bool,
 }
 
@@ -542,6 +576,7 @@ impl App {
             dir_prompt,
             action_prompt: None,
             terminal: config::detect_terminal(),
+            esc_burst: EscBurst::default(),
             should_quit: false,
         }
     }
@@ -795,6 +830,32 @@ impl App {
         self.claude_selected = None;
         self.claude_session_selected = None;
         self.focus = Focus::Tabs;
+    }
+
+    // Feed a key to the triple-Esc tracker. True means this key completed
+    // a burst and the caller should go home instead of handling it.
+    // Plain Esc only — Alt-Esc and friends are different keys as far as
+    // the burst is concerned, and they reset it like any other key.
+    fn note_esc_burst(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.esc_burst.press(Instant::now())
+        } else {
+            self.esc_burst.reset();
+            false
+        }
+    }
+
+    // Triple-Esc target: git status tab, tab bar focused, every modal and
+    // drill-down torn down. The one thing left standing is the forced
+    // first-launch directory prompt, which the user has to answer.
+    fn go_home(&mut self) {
+        self.menu_stack.clear();
+        self.action_prompt = None;
+        if self.dir_prompt.as_ref().is_some_and(|p| p.can_cancel) {
+            self.dir_prompt = None;
+        }
+        self.set_tab(Tab::GitStatus);
+        self.reset_tab_state();
     }
 
     // Entering the git-activity pane from tabs: land the cursor on the top repo
@@ -1555,6 +1616,10 @@ impl App {
         let Event::Key(key) = event::read()? else {
             return Ok(());
         };
+        if self.note_esc_burst(key) {
+            self.go_home();
+            return Ok(());
+        }
         // Modals take precedence over the tab/pane input. The prompt sits
         // above the menu in priority so if we ever open both, the prompt
         // wins.
@@ -6162,6 +6227,49 @@ mod tests {
         assert_eq!(MAIN_ITEMS.len(), MAIN_LABELS.len());
         assert_eq!(SETTINGS_ITEMS.len(), SETTINGS_LABELS.len());
         assert_eq!(REPO_ACTION_ITEMS.len(), REPO_ACTION_LABELS.len());
+    }
+
+    // -------------------- triple-Esc --------------------
+
+    #[test]
+    fn three_quick_escs_fire_once_and_start_over() {
+        let mut burst = EscBurst::default();
+        let t0 = Instant::now();
+        assert!(!burst.press(t0));
+        assert!(!burst.press(t0 + Duration::from_millis(500)));
+        assert!(burst.press(t0 + Duration::from_millis(1000)));
+        // The run is consumed: a fourth press is the start of a new one.
+        assert!(!burst.press(t0 + Duration::from_millis(1100)));
+    }
+
+    #[test]
+    fn slow_escs_never_add_up_to_a_burst() {
+        let mut burst = EscBurst::default();
+        let t0 = Instant::now();
+        assert!(!burst.press(t0));
+        assert!(!burst.press(t0 + Duration::from_secs(2)));
+        // The first press has aged out by now; only two remain in-window.
+        assert!(!burst.press(t0 + Duration::from_secs(4)));
+        assert!(burst.press(t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_burst_counts_presses_within_the_window_inclusive() {
+        let mut burst = EscBurst::default();
+        let t0 = Instant::now();
+        burst.press(t0);
+        burst.press(t0 + Duration::from_secs(1));
+        assert!(burst.press(t0 + ESC_BURST_WINDOW));
+    }
+
+    #[test]
+    fn any_other_key_breaks_the_run() {
+        let mut burst = EscBurst::default();
+        let t0 = Instant::now();
+        burst.press(t0);
+        burst.press(t0 + Duration::from_millis(100));
+        burst.reset();
+        assert!(!burst.press(t0 + Duration::from_millis(200)));
     }
 
     // -------------------- directory prompt --------------------

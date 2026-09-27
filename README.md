@@ -71,6 +71,7 @@ On first launch you'll be asked for the directory to watch — the folder that c
 | `Enter` | Claude detail | Resume the selected session in your terminal |
 | `←` / `h` / `Esc` | Detail views | Back to the list |
 | `Esc` | Tab bar | Open the menu (Settings, Exit) |
+| `Esc` ×3 within 3s | Anywhere | Jump home: git status tab, tab bar focused, every menu and detail view closed |
 | `q` / `Ctrl-C` | Anywhere | Quit |
 
 Vim keys (`h j k l`) work wherever arrows do.
