@@ -1202,6 +1202,22 @@ impl App {
         }
     }
 
+    // Enter on the Claude tab with nothing selected (cursor still on the
+    // tab bar): open a new terminal window at $HOME running `claude` — a
+    // quick "just give me a session" that isn't tied to any project.
+    fn start_claude_at_home(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.set_notice("HOME is not set".to_string());
+            return;
+        };
+        let terminal = self
+            .terminal
+            .unwrap_or(config::TerminalApp::TerminalApp);
+        if !claude::open_in_terminal(terminal, &home, Some("claude")) {
+            self.set_notice(NO_TERMINAL_NOTICE.to_string());
+        }
+    }
+
     // The Claude tab's own interactions — the same shape as
     // handle_network_key / handle_process_key, except the detail view has
     // its own session cursor (with scroll following the selection).
@@ -1267,8 +1283,13 @@ impl App {
             }
             // Right mirrors Enter for drill-down, pairing with Left = back.
             // On the tab bar, Right falls through to cycle tabs.
+            // On the tab bar, Enter starts a fresh session at $HOME and
+            // Right falls through to cycle tabs.
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.focus == Focus::Tabs {
+                    if key.code == KeyCode::Enter {
+                        self.start_claude_at_home();
+                    }
                     return key.code == KeyCode::Enter;
                 }
                 if let Some(n) = &self.claude_selected {
@@ -5078,7 +5099,7 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
     let hint = if focused {
         " (↑/↓ select · Enter sessions)"
     } else {
-        ""
+        " (Enter new session in ~)"
     };
     let cost_part = if tree.total_cost_usd >= 0.01 {
         format!(" · {}", format_cost(tree.total_cost_usd))
