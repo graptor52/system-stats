@@ -718,14 +718,23 @@ pub fn reveal_in_file_manager(dir: &Path) {
 }
 
 // Open a new terminal window, cd into the project, and re-attach to a
-// session with `claude --resume`. Thin wrapper over open_in_terminal.
+// session with `<claude_command> --resume`. Thin wrapper over
+// open_in_terminal.
 pub fn resume_in_terminal(
     terminal: config::TerminalApp,
+    claude_command: &str,
     project_dir: &Path,
     session_id: &str,
 ) -> bool {
-    let command = format!("claude --resume {}", shell_quote(session_id));
+    let command = resume_command(claude_command, session_id);
     open_in_terminal(terminal, project_dir, Some(&command))
+}
+
+// The text typed into the shell to resume a session. The configured
+// command goes in verbatim — a bare name resolves through the login
+// shell's PATH, and a user-supplied wrapper may carry its own flags.
+fn resume_command(claude_command: &str, session_id: &str) -> String {
+    format!("{claude_command} --resume {}", shell_quote(session_id))
 }
 
 // Single-quote for POSIX shells: '…' with embedded quotes as '\''.
@@ -1082,6 +1091,21 @@ mod tests {
     fn shell_quoting() {
         assert_eq!(shell_quote("/Users/a/My Code"), "'/Users/a/My Code'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn resume_command_uses_the_configured_command() {
+        assert_eq!(resume_command("claude", "x"), "claude --resume 'x'");
+        assert_eq!(
+            resume_command("claudeandrew", "93fb531a"),
+            "claudeandrew --resume '93fb531a'"
+        );
+        // Flags in the configured command land before --resume, and the
+        // session id goes through shell_quote whichever program runs.
+        assert_eq!(
+            resume_command("claudeandrew --model opus", "it's"),
+            r"claudeandrew --model opus --resume 'it'\''s'"
+        );
     }
 
     #[cfg(target_os = "macos")]

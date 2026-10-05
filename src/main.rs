@@ -91,16 +91,22 @@ const MAIN_LABELS: [&str; 2] = ["Settings", "Exit"];
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsItem {
     WatchDir,
+    // The command that starts Claude sessions (plain `claude`, or a
+    // wrapper the user names). Enter opens a one-line prompt; the current
+    // value is appended to the label at draw time.
+    ClaudeCommand,
 }
 
-const SETTINGS_ITEMS: [SettingsItem; 1] = [SettingsItem::WatchDir];
-const SETTINGS_LABELS: [&str; 1] = ["Watch directory"];
+const SETTINGS_ITEMS: [SettingsItem; 2] =
+    [SettingsItem::WatchDir, SettingsItem::ClaudeCommand];
+const SETTINGS_LABELS: [&str; 2] = ["Watch directory", "Claude command"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RepoActionItem {
     // Open a plain terminal at the repo dir.
     Terminal,
-    // Open a terminal at the repo dir and start a fresh `claude` session.
+    // Open a terminal at the repo dir and start a fresh Claude session
+    // (via the configured launcher).
     Claude,
     // Open the repo dir as a folder in VS Code (cross-platform `code` CLI).
     VsCode,
@@ -276,6 +282,20 @@ impl DirectoryPrompt {
                 .map(|cwd| cwd.join(&expanded))
                 .unwrap_or(expanded)
         }
+    }
+}
+
+// Modal for changing the command that starts Claude sessions. Opened from
+// Settings, prefilled with the current value; always cancelable since the
+// default (`claude`) is a fine answer.
+struct CommandPrompt {
+    line: InputLine,
+    error: Option<String>,
+}
+
+impl CommandPrompt {
+    fn new(current: &str) -> Self {
+        Self { line: InputLine::new(current.to_string()), error: None }
     }
 }
 
@@ -507,6 +527,9 @@ struct App {
     // above the menu stack — closing it drops the user back onto whichever
     // menu was topmost, so Esc-out-of-prompt naturally returns to Settings.
     dir_prompt: Option<DirectoryPrompt>,
+    // Settings → Claude command. Same modal priority as dir_prompt (the
+    // Settings menu stays on the stack underneath).
+    command_prompt: Option<CommandPrompt>,
     // When Some, the custom-action editor is open. Same layering as
     // dir_prompt: the repo action menu stays on the stack underneath, so
     // closing the editor (save or Esc) drops back onto that menu.
@@ -574,6 +597,7 @@ impl App {
             claude_detail_scroll: Cell::new(0),
             menu_stack: Vec::new(),
             dir_prompt,
+            command_prompt: None,
             action_prompt: None,
             terminal: config::detect_terminal(),
             esc_burst: EscBurst::default(),
@@ -851,6 +875,7 @@ impl App {
     fn go_home(&mut self) {
         self.menu_stack.clear();
         self.action_prompt = None;
+        self.command_prompt = None;
         if self.dir_prompt.as_ref().is_some_and(|p| p.can_cancel) {
             self.dir_prompt = None;
         }
@@ -1221,7 +1246,7 @@ impl App {
     }
 
     // Enter on a session in the detail view: open a new window in the
-    // user's terminal, cd into the project, and `claude --resume` the
+    // user's terminal, cd into the project, and `<launcher> --resume` the
     // session. Live sessions are skipped — they're already attached in
     // some terminal, and a second client would interleave into the same
     // transcript — but say so, because the detail view auto-selects the
@@ -1258,14 +1283,16 @@ impl App {
             .terminal
             .unwrap_or(config::TerminalApp::TerminalApp);
         let (path, id) = (project.path.clone(), session.id.clone());
-        if !claude::resume_in_terminal(terminal, &path, &id) {
+        let command = self.config.claude_command.clone();
+        if !claude::resume_in_terminal(terminal, &command, &path, &id) {
             self.set_notice(NO_TERMINAL_NOTICE.to_string());
         }
     }
 
     // Enter on the Claude tab with nothing selected (cursor still on the
-    // tab bar): open a new terminal window at $HOME running `claude` — a
-    // quick "just give me a session" that isn't tied to any project.
+    // tab bar): open a new terminal window at $HOME running the configured
+    // Claude launcher — a quick "just give me a session" that isn't tied
+    // to any project.
     fn start_claude_at_home(&mut self) {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             self.set_notice("HOME is not set".to_string());
@@ -1274,7 +1301,8 @@ impl App {
         let terminal = self
             .terminal
             .unwrap_or(config::TerminalApp::TerminalApp);
-        if !claude::open_in_terminal(terminal, &home, Some("claude")) {
+        let command = self.config.claude_command.clone();
+        if !claude::open_in_terminal(terminal, &home, Some(&command)) {
             self.set_notice(NO_TERMINAL_NOTICE.to_string());
         }
     }
@@ -1399,9 +1427,16 @@ impl App {
     fn menu_labels(&self, menu: &Menu) -> Vec<String> {
         match menu.kind {
             MenuKind::Main => MAIN_LABELS.iter().map(|s| s.to_string()).collect(),
-            MenuKind::Settings => {
-                SETTINGS_LABELS.iter().map(|s| s.to_string()).collect()
-            }
+            MenuKind::Settings => SETTINGS_ITEMS
+                .iter()
+                .zip(SETTINGS_LABELS)
+                .map(|(item, label)| match item {
+                    SettingsItem::ClaudeCommand => {
+                        format!("{label}: {}", self.config.claude_command)
+                    }
+                    SettingsItem::WatchDir => label.to_string(),
+                })
+                .collect(),
             MenuKind::RepoAction => {
                 let mut labels: Vec<String> =
                     REPO_ACTION_LABELS.iter().map(|s| s.to_string()).collect();
@@ -1482,6 +1517,10 @@ impl App {
                         true,
                     ));
                 }
+                SettingsItem::ClaudeCommand => {
+                    self.command_prompt =
+                        Some(CommandPrompt::new(&self.config.claude_command));
+                }
             },
             MenuKind::RepoAction => {
                 // Resolve the selected repo fresh — a rescan could have
@@ -1507,7 +1546,8 @@ impl App {
                             }
                         }
                         RepoActionItem::Claude => {
-                            if !claude::open_in_terminal(terminal, &path, Some("claude")) {
+                            let command = self.config.claude_command.clone();
+                            if !claude::open_in_terminal(terminal, &path, Some(&command)) {
                                 self.set_notice(NO_TERMINAL_NOTICE.to_string());
                             }
                         }
@@ -1562,6 +1602,27 @@ impl App {
     // Commit the prompt: validate → write to disk → tell the scanner. If any
     // step fails we leave the prompt open with an error message so the user
     // can fix it in place.
+    // Enter in the Claude-command prompt: trim, refuse blank, persist.
+    // Like the directory prompt, in-memory config only changes once the
+    // file did, and a no-op accept skips the write.
+    fn submit_command_prompt(&mut self) {
+        let Some(prompt) = self.command_prompt.as_mut() else { return };
+        let Some(command) = config::normalize_claude_command(&prompt.line.input) else {
+            prompt.error = Some("command can't be empty".to_string());
+            return;
+        };
+        if command != self.config.claude_command {
+            let mut new_config = self.config.clone();
+            new_config.claude_command = command;
+            if let Err(e) = new_config.save() {
+                prompt.error = Some(format!("failed to save config: {e}"));
+                return;
+            }
+            self.config = new_config;
+        }
+        self.command_prompt = None;
+    }
+
     fn submit_dir_prompt(&mut self) {
         let Some(prompt) = self.dir_prompt.as_mut() else { return };
         let resolved = prompt.resolved_path();
@@ -1625,6 +1686,10 @@ impl App {
         // wins.
         if self.dir_prompt.is_some() {
             self.handle_prompt_key(key);
+            return Ok(());
+        }
+        if self.command_prompt.is_some() {
+            self.handle_command_prompt_key(key);
             return Ok(());
         }
         if self.action_prompt.is_some() {
@@ -1706,6 +1771,23 @@ impl App {
             (KeyCode::Enter, _) => self.submit_dir_prompt(),
             _ => {
                 if let Some(p) = self.dir_prompt.as_mut()
+                    && Self::apply_line_edit(&mut p.line, key)
+                {
+                    p.error = None;
+                }
+            }
+        }
+    }
+
+    fn handle_command_prompt_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), m) if m == KeyModifiers::CONTROL => {
+                self.should_quit = true;
+            }
+            (KeyCode::Esc, _) => self.command_prompt = None,
+            (KeyCode::Enter, _) => self.submit_command_prompt(),
+            _ => {
+                if let Some(p) = self.command_prompt.as_mut()
                     && Self::apply_line_edit(&mut p.line, key)
                 {
                     p.error = None;
@@ -2010,36 +2092,85 @@ fn draw(f: &mut Frame, app: &App) {
     if app.action_prompt.is_some() {
         draw_action_prompt(f, app);
     }
+    if app.command_prompt.is_some() {
+        draw_command_prompt(f, app);
+    }
     if app.dir_prompt.is_some() {
         draw_directory_prompt(f, app);
     }
 }
 
-// Modal for picking / changing the watched directory. Renders a text
-// input with a horizontally-scrolling window so long paths stay usable,
-// plus optional error line and a keybinding hint.
+// Modal for the command that starts Claude sessions. Same one-line layout
+// as the directory prompt, with a note under the field saying how the
+// value is used.
+fn draw_command_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = &app.command_prompt else { return };
+    draw_line_prompt(
+        f,
+        LinePromptView {
+            title: " Claude command ",
+            label: "Command: ",
+            line: &prompt.line,
+            note: Some("run in a new terminal; --resume <id> is appended"),
+            error: prompt.error.as_deref(),
+            hint: "Enter to save · Esc to cancel",
+        },
+    );
+}
+
+// Modal for picking / changing the watched directory.
 fn draw_directory_prompt(f: &mut Frame, app: &App) {
     let Some(prompt) = &app.dir_prompt else { return };
+    let (title, hint) = if prompt.can_cancel {
+        (" Watch directory ", "Enter to save · Esc to cancel")
+    } else {
+        (" Welcome — pick a directory to watch ", "Enter to save · Ctrl-C to quit")
+    };
+    draw_line_prompt(
+        f,
+        LinePromptView {
+            title,
+            label: "Directory: ",
+            line: &prompt.line,
+            note: None,
+            error: prompt.error.as_deref(),
+            hint,
+        },
+    );
+}
 
+// Everything a one-line prompt modal needs to draw itself.
+struct LinePromptView<'a> {
+    title: &'a str,
+    label: &'a str,
+    line: &'a InputLine,
+    // Optional grey line under the field explaining how the value is used.
+    note: Option<&'a str>,
+    error: Option<&'a str>,
+    hint: &'a str,
+}
+
+// Shared body of the single-field modals (watch directory, Claude
+// command). Renders a text input with a horizontally-scrolling window so
+// long values stay usable, plus optional note and error lines and a
+// keybinding hint.
+fn draw_line_prompt(f: &mut Frame, view: LinePromptView<'_>) {
     let full = f.area();
     // Cap the modal so it doesn't dominate a wide terminal but grows
     // wide enough to make long paths comfortable.
     let width = full.width.clamp(40, 72);
-    let height: u16 = if prompt.error.is_some() { 9 } else { 7 };
+    let height: u16 = 7
+        + if view.note.is_some() { 1 } else { 0 }
+        + if view.error.is_some() { 2 } else { 0 };
     let area = centered_rect(width, height, full);
     f.render_widget(Clear, area);
 
-    let title = if prompt.can_cancel {
-        " Watch directory "
-    } else {
-        " Welcome — pick a directory to watch "
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+        .title(view.title);
 
-    let label = "Directory: ";
+    let label = view.label;
     let label_len = label.chars().count();
     // Space for the input inside the block, after the label. `saturating_sub`
     // handles a pathologically narrow terminal — width is clamped above but
@@ -2048,29 +2179,30 @@ fn draw_directory_prompt(f: &mut Frame, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let input_area_width = inner_width.saturating_sub(label_len);
     let (visible, cursor_offset) =
-        input_window(&prompt.line.input, prompt.line.cursor, input_area_width);
+        input_window(&view.line.input, view.line.cursor, input_area_width);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(label.to_string(), Style::default().fg(Color::DarkGray)),
         Span::raw(visible),
     ]));
-    if let Some(err) = &prompt.error {
+    if let Some(note) = view.note {
+        lines.push(Line::from(Span::styled(
+            format!("{:width$}{note}", "", width = label_len),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(err) = view.error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            err.clone(),
+            err.to_string(),
             Style::default().fg(Color::Red),
         )));
     }
     lines.push(Line::from(""));
-    let hint = if prompt.can_cancel {
-        "Enter to save · Esc to cancel"
-    } else {
-        "Enter to save · Ctrl-C to quit"
-    };
     lines.push(Line::from(Span::styled(
-        hint,
+        view.hint.to_string(),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -6282,6 +6414,14 @@ mod tests {
         // Shown tilde-shortened, saved absolute.
         assert_eq!(prompt.line.input, "~/Documents/code");
         assert_eq!(prompt.resolved_path(), dir);
+    }
+
+    #[test]
+    fn command_prompt_prefills_the_current_command() {
+        let prompt = CommandPrompt::new("claudeandrew");
+        assert_eq!(prompt.line.input, "claudeandrew");
+        assert_eq!(prompt.line.cursor, "claudeandrew".chars().count());
+        assert!(prompt.error.is_none());
     }
 
     #[test]

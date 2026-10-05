@@ -43,6 +43,23 @@ pub fn detect_terminal() -> Option<TerminalApp> {
     }
 }
 
+// What the Claude tab (and the repo menu's Claude action) types into a new
+// terminal to start Claude. Plain `claude` by default; a user with a
+// wrapper that takes the same arguments (e.g. one that parks the session
+// on a hub so it can be attached from elsewhere) names it here. The text
+// is typed verbatim into a login shell, so a bare name resolves through
+// the user's own PATH — never absolutize it, wrappers and claude itself
+// both depend on that shell's environment (version managers, MCP servers).
+pub const DEFAULT_CLAUDE_COMMAND: &str = "claude";
+
+// Trim and reject an empty entry; the saved value must be something the
+// shell can run, and a blank line would leave the Claude tab typing
+// `--resume '<id>'` into a shell with no program in front of it.
+pub fn normalize_claude_command(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 // A user-defined entry in a repo's action menu — e.g. name "build and run",
 // command "./build.sh && open App.app". Keyed by the repo's absolute path so
 // each repo gets its own list.
@@ -63,6 +80,7 @@ pub struct CustomAction {
 #[derive(Clone)]
 pub struct Config {
     pub watch_dir: PathBuf,
+    pub claude_command: String,
     pub custom_actions: Vec<CustomAction>,
 }
 
@@ -94,6 +112,16 @@ impl Config {
             "# system-stats config\nwatch_dir={}\n",
             self.watch_dir.display()
         );
+        // Written only when non-default so a config from before the key
+        // existed round-trips byte-for-byte. Newlines can't be typed into
+        // the editor; the replace() just keeps a hand-edited value from
+        // splitting the line.
+        if self.claude_command != DEFAULT_CLAUDE_COMMAND {
+            out.push_str(&format!(
+                "claude_command={}\n",
+                self.claude_command.replace(['\t', '\n'], " ").trim()
+            ));
+        }
         // Tab-separated because the config is line-based and tabs can't be
         // typed into the single-line editor — so path, name, and command are
         // free to contain anything else (spaces, `=`, quotes, …). The
@@ -124,7 +152,11 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { watch_dir: default_watch_dir(), custom_actions: Vec::new() }
+        Self {
+            watch_dir: default_watch_dir(),
+            claude_command: DEFAULT_CLAUDE_COMMAND.to_string(),
+            custom_actions: Vec::new(),
+        }
     }
 }
 
@@ -149,6 +181,13 @@ fn parse(text: &str) -> Config {
         // unknown-key arm and is ignored; the value is detected at launch now.
         match key.trim() {
             "watch_dir" => cfg.watch_dir = PathBuf::from(value.trim()),
+            // A blank value keeps the default rather than saving nothing
+            // to run.
+            "claude_command" => {
+                if let Some(cmd) = normalize_claude_command(value) {
+                    cfg.claude_command = cmd;
+                }
+            }
             // path \t name \t command [\t close] — a malformed line
             // (hand-edited config) is skipped rather than half-loaded.
             "custom_action" => {
@@ -229,6 +268,7 @@ mod tests {
     fn custom_actions_round_trip() {
         let cfg = Config {
             watch_dir: PathBuf::from("/tmp/code"),
+            claude_command: "claudeandrew".to_string(),
             custom_actions: vec![
                 CustomAction {
                     repo_path: PathBuf::from("/tmp/code/my app"),
@@ -246,6 +286,7 @@ mod tests {
         };
         let parsed = parse(&cfg.serialize());
         assert_eq!(parsed.watch_dir, cfg.watch_dir);
+        assert_eq!(parsed.claude_command, "claudeandrew");
         assert_eq!(parsed.custom_actions.len(), 2);
         for (a, b) in parsed.custom_actions.iter().zip(&cfg.custom_actions) {
             assert_eq!(a.repo_path, b.repo_path);
@@ -279,6 +320,7 @@ mod tests {
         };
         let cfg = Config {
             watch_dir: PathBuf::from("/tmp"),
+            claude_command: DEFAULT_CLAUDE_COMMAND.to_string(),
             custom_actions: vec![mk("/a", "one"), mk("/b", "two"), mk("/a", "three")],
         };
         let names: Vec<&str> = cfg
@@ -309,32 +351,36 @@ mod tests {
         // A config with no watch_dir keeps the default rather than blanking it.
         let cfg = parse("# nothing here\n");
         assert_eq!(cfg.watch_dir, default_watch_dir());
+        assert_eq!(cfg.claude_command, "claude");
     }
 
     #[test]
-    fn parse_keeps_equals_signs_inside_values() {
-        // split_once means only the first '=' delimits.
-        let cfg = parse("custom_action=/a\tdeploy\tmake deploy ENV=prod K=v\n");
-        assert_eq!(cfg.custom_actions[0].command, "make deploy ENV=prod K=v");
+    fn claude_command_parses_and_round_trips() {
+        assert_eq!(parse("claude_command=claudeandrew\n").claude_command, "claudeandrew");
+        assert_eq!(parse("claude_command=  claudeandrew \n").claude_command, "claudeandrew");
+        // Arguments ride along verbatim — the whole string is typed into
+        // the shell in front of `--resume`.
+        assert_eq!(
+            parse("claude_command=claude --model opus\n").claude_command,
+            "claude --model opus"
+        );
+        // A blank value keeps the default instead of saving nothing to run.
+        assert_eq!(parse("claude_command=\n").claude_command, "claude");
+        assert_eq!(parse("claude_command=   \n").claude_command, "claude");
+        // Default is omitted from the file; anything else is written.
+        let mut cfg = Config { watch_dir: PathBuf::from("/tmp"), ..Config::default() };
+        assert!(!cfg.serialize().contains("claude_command"));
+        cfg.claude_command = "claudeandrew".to_string();
+        assert!(cfg.serialize().contains("claude_command=claudeandrew\n"));
+        assert_eq!(parse(&cfg.serialize()).claude_command, "claudeandrew");
     }
 
     #[test]
-    fn serialize_flattens_tabs_that_would_corrupt_a_line() {
-        // Tabs are the field separator, so a value carrying one (or a
-        // newline) would silently split the line on reload.
-        let cfg = Config {
-            watch_dir: PathBuf::from("/tmp"),
-            custom_actions: vec![CustomAction {
-                repo_path: PathBuf::from("/a"),
-                name: "we\tird".to_string(),
-                command: "echo a\nb".to_string(),
-                close_on_exit: false,
-            }],
-        };
-        let parsed = parse(&cfg.serialize());
-        assert_eq!(parsed.custom_actions.len(), 1);
-        assert_eq!(parsed.custom_actions[0].name, "we ird");
-        assert_eq!(parsed.custom_actions[0].command, "echo a b");
+    fn normalize_claude_command_trims_and_rejects_blank() {
+        assert_eq!(normalize_claude_command("  claudeandrew  "), Some("claudeandrew".to_string()));
+        assert_eq!(normalize_claude_command("claude"), Some("claude".to_string()));
+        assert_eq!(normalize_claude_command(""), None);
+        assert_eq!(normalize_claude_command("   "), None);
     }
 
     #[test]

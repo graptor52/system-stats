@@ -83,9 +83,14 @@ A single, human-editable file at `~/.config/system-stats/config` (or `$XDG_CONFI
 ```ini
 # system-stats config
 watch_dir=/Users/you/Documents/code
+claude_command=claude
 ```
 
-Change it from inside the app via `Esc → Settings → Watch directory`, or edit the file directly. The terminal app used for resuming Claude sessions is *not* configured — it's detected from `TERM_PROGRAM` at every launch, so it follows you between terminal apps (falling back to Terminal.app under tmux or editor-embedded terminals).
+Change them from inside the app via `Esc → Settings`, or edit the file directly.
+
+`claude_command` is what gets typed into the new terminal when the app starts or resumes a Claude session (from the Claude tab, or the repo menu's Claude action). It defaults to `claude` and is omitted from the file in that case. Point it at a wrapper that accepts the same arguments — for example one that parks the session on a hub so it can be attached from a browser or phone — and every session the app launches goes through it. The text is typed verbatim into a login shell in front of `--resume <id>`, so a bare name resolves through your PATH and flags are allowed (`claude --model opus`). A blank value falls back to `claude`.
+
+The terminal app used for resuming Claude sessions is *not* configured — it's detected from `TERM_PROGRAM` at every launch, so it follows you between terminal apps (falling back to Terminal.app under tmux or editor-embedded terminals).
 
 ## Notes and caveats
 
