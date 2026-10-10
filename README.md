@@ -20,6 +20,7 @@ Points at a single "watch directory" (e.g. `~/Documents/code`) and scans every r
 
 - A GitHub-style commit heatmap of *your* commits (matched by `git config user.email`), for all repos combined or the selected one
 - Per-repo tree: branches with ahead/behind counts, current-branch marker, uncommitted-changes flag, and fork drift against an `upstream` remote
+- A magenta **◆ Claude working** (or grey *Claude idle*) marker on any repo with a live Claude Code session in it, so you can see at a glance where agents are running
 - A colored, lane-styled commit graph for the selected repo, plus a recent-commits feed across all repos
 - **Press Enter on a repo** for actions: open a terminal there, start a new Claude session, or **Inspect git** — a full-screen commit graph with per-commit sha, diff stats (+added −removed, files touched), absolute date, and author; Esc goes back
 
@@ -29,6 +30,7 @@ Maps each project under the watch directory to its Claude Code session history (
 
 - Every session with its AI-generated title, prompt count, git branch, and age; **live sessions** show a green busy/idle badge and the prompt they're currently working on
 - Per-session stats: wall-clock duration, output tokens, which model(s) ran it, a tool-mix profile (`59 Edit · 58 Bash` reads as a build session; `15 WebSearch` as research), and an **API-equivalent cost estimate** (`~$23`) — notional if you're on a subscription plan, computed per message at published API rates
+- **Press `f` to filter the list** to live sessions, or to those active in the last 24 hours or 7 days; a project stays listed while any of its sessions match, and its card shows only the matching ones
 - **Press Enter on an inactive session to resume it**: a new window opens in the terminal app you're currently using (Ghostty, iTerm2, or Terminal.app — detected automatically at launch), cd'd into the project, running `claude --resume`
 
 ### Processes
@@ -69,6 +71,7 @@ On first launch you'll be asked for the directory to watch — the folder that c
 | `↑` `↓` / `k` `j` | Lists | Move the selection |
 | `Enter` / `→` / `l` | Lists | Open detail view for the selected item |
 | `Enter` | Claude detail | Resume the selected session in your terminal |
+| `f` | Claude list | Cycle the filter: all → live → last 24h → last 7d |
 | `←` / `h` / `Esc` | Detail views | Back to the list |
 | `Esc` | Tab bar | Open the menu (Settings, Exit) |
 | `Esc` ×3 within 3s | Anywhere | Jump home: git status tab, tab bar focused, every menu and detail view closed |

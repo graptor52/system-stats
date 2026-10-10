@@ -550,6 +550,7 @@ struct App {
     claude_scanner: claude::Scanner,
     claude_tree: Option<ClaudeTree>,
     claude_selected: Option<String>,
+    claude_filter: ClaudeFilter,
     claude_detail: Option<String>,
     claude_scroll: Cell<u16>,
     // Detail-view session cursor (by session id — stable across the
@@ -636,6 +637,7 @@ impl App {
             claude_scanner,
             claude_tree: None,
             claude_selected: None,
+            claude_filter: ClaudeFilter::All,
             claude_detail: None,
             claude_scroll: Cell::new(0),
             claude_session_selected: None,
@@ -1241,9 +1243,16 @@ impl App {
     }
 
     fn claude_sorted_names(&self) -> Vec<String> {
+        let (filter, now) = (self.claude_filter, unix_now());
         self.claude_tree
             .as_ref()
-            .map(|t| t.projects.iter().map(|p| p.name.clone()).collect())
+            .map(|t| {
+                t.projects
+                    .iter()
+                    .filter(|p| filter.keeps_project(p, now))
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1419,6 +1428,24 @@ impl App {
                     self.claude_selected = None;
                 } else {
                     self.move_claude_selection(-1);
+                }
+                true
+            }
+            KeyCode::Char('f') => {
+                self.claude_filter = self.claude_filter.next();
+                // Keep the cursor on something that's still listed.
+                let visible = self.claude_sorted_names();
+                let still_there = self
+                    .claude_selected
+                    .as_ref()
+                    .map(|n| visible.contains(n))
+                    .unwrap_or(false);
+                if !still_there {
+                    self.claude_selected = if self.focus == Focus::Right {
+                        visible.first().cloned()
+                    } else {
+                        None
+                    };
                 }
                 true
             }
@@ -3071,8 +3098,13 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )
             .right_aligned();
-            let (lines, extents) =
-                render_git_tree(tree, app.selected_repo, app.git_pull.as_ref());
+            let claude_live = claude_activity_by_repo(tree, app.claude_tree.as_ref());
+            let (lines, extents) = render_git_tree(
+                tree,
+                app.selected_repo,
+                app.git_pull.as_ref(),
+                &claude_live,
+            );
 
             // Auto-scroll to keep the selected repo in view. The Paragraph
             // clips content past the pane's height, so without this a
@@ -3211,6 +3243,52 @@ fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
     None
 }
 
+// Live Claude sessions working inside one repo, for the Git tab's marker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RepoClaude {
+    live: usize,
+    busy: usize,
+}
+
+// Fold the Claude tree's live sessions onto the git tree's repos. A session
+// counts for a repo when its project directory is the repo root or sits
+// inside it (a session started in `repo/subdir`). Keyed by repo path.
+fn claude_activity_by_repo(
+    git: &GitTree,
+    claude: Option<&ClaudeTree>,
+) -> HashMap<PathBuf, RepoClaude> {
+    let mut out: HashMap<PathBuf, RepoClaude> = HashMap::new();
+    let Some(claude) = claude else {
+        return out;
+    };
+    for project in &claude.projects {
+        let (mut live, mut busy) = (0, 0);
+        for s in &project.sessions {
+            if let Some(l) = &s.live {
+                live += 1;
+                if l.status == "busy" {
+                    busy += 1;
+                }
+            }
+        }
+        if live == 0 {
+            continue;
+        }
+        // Deepest matching repo wins when repos nest.
+        let owner = git
+            .repos
+            .iter()
+            .filter(|r| project.path.starts_with(&r.path))
+            .max_by_key(|r| r.path.components().count());
+        if let Some(r) = owner {
+            let e = out.entry(r.path.clone()).or_default();
+            e.live += live;
+            e.busy += busy;
+        }
+    }
+    out
+}
+
 // Returns the rendered lines and, for each repo, `(start_line, height)`
 // covering that repo's block (header + tree rows + trailing blank).
 // Callers use the extents to auto-scroll so the current selection stays
@@ -3219,6 +3297,7 @@ fn render_git_tree(
     tree: &GitTree,
     selected: Option<usize>,
     pull: Option<&PullState>,
+    claude: &HashMap<PathBuf, RepoClaude>,
 ) -> (Vec<Line<'static>>, Vec<(u16, u16)>) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3274,6 +3353,22 @@ fn render_git_tree(
             header_spans.push(Span::styled(
                 upstream.clone(),
                 Style::default().fg(Color::Yellow),
+            ));
+        }
+        if let Some(c) = claude.get(&repo.path) {
+            let (text, color) = if c.busy > 0 {
+                ("Claude working", Color::Magenta)
+            } else {
+                ("Claude idle", Color::DarkGray)
+            };
+            let count = if c.live > 1 {
+                format!(" ×{}", c.live)
+            } else {
+                String::new()
+            };
+            header_spans.push(Span::styled(
+                format!("   ◆ {text}{count}"),
+                Style::default().fg(color),
             ));
         }
         match pull {
@@ -5312,6 +5407,59 @@ fn claude_session_title(session: &claude::SessionInfo) -> String {
     format!("session {short}")
 }
 
+// Which sessions the Claude list shows, cycled with `f`. A project stays
+// listed while at least one of its sessions matches, and its card shows
+// only the matching ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeFilter {
+    All,
+    Live,
+    Day,
+    Week,
+}
+
+impl ClaudeFilter {
+    fn next(self) -> Self {
+        match self {
+            ClaudeFilter::All => ClaudeFilter::Live,
+            ClaudeFilter::Live => ClaudeFilter::Day,
+            ClaudeFilter::Day => ClaudeFilter::Week,
+            ClaudeFilter::Week => ClaudeFilter::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ClaudeFilter::All => "all",
+            ClaudeFilter::Live => "live",
+            ClaudeFilter::Day => "last 24h",
+            ClaudeFilter::Week => "last 7d",
+        }
+    }
+
+    fn matches(self, session: &claude::SessionInfo, now: u64) -> bool {
+        let age = now.saturating_sub(session.last_activity);
+        match self {
+            ClaudeFilter::All => true,
+            // A live session always counts, whatever its transcript mtime.
+            ClaudeFilter::Live => session.live.is_some(),
+            ClaudeFilter::Day => session.live.is_some() || age < 86_400,
+            ClaudeFilter::Week => session.live.is_some() || age < 7 * 86_400,
+        }
+    }
+
+    fn keeps_project(self, project: &ProjectSessions, now: u64) -> bool {
+        project.sessions.iter().any(|s| self.matches(s, now))
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // Which client a session came from, for the row badge. Claude Code records
 // the CLI as "cli" and the desktop app as "claude-desktop"; anything else
 // (including transcripts that don't say) shows no badge rather than a guess.
@@ -5454,9 +5602,15 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
         String::new()
     };
     let hint = if focused {
-        " (↑/↓ select · Enter sessions)"
+        " (↑/↓ select · Enter sessions · f filter)"
     } else {
         " (Enter new session in ~)"
+    };
+    let filter = app.claude_filter;
+    let filter_part = if filter == ClaudeFilter::All {
+        String::new()
+    } else {
+        format!(" · showing {}", filter.label())
     };
     let cost_part = if tree.total_cost_usd >= 0.01 {
         format!(" · {}", format_cost(tree.total_cost_usd))
@@ -5464,7 +5618,7 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
         String::new()
     };
     let title = format!(
-        " Claude — {} project{} · {} session{}{cost_part}{live_part} · scanned {rounded}s ago{hint} ",
+        " Claude — {} project{} · {} session{}{cost_part}{live_part}{filter_part} · scanned {rounded}s ago{hint} ",
         tree.projects.len(),
         if tree.projects.len() == 1 { "" } else { "s" },
         tree.total_sessions,
@@ -5479,10 +5633,7 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = unix_now();
 
     let mut lines: Vec<Line<'static>> = vec![Line::from("")];
     // (start_line, height) of the selected card, for scroll-into-view.
@@ -5492,12 +5643,17 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
             format!("  no Claude Code sessions under {}.", tree.root_display),
             Style::default().fg(Color::DarkGray),
         )));
+    } else if !tree.projects.iter().any(|p| filter.keeps_project(p, now)) {
+        lines.push(Line::from(Span::styled(
+            format!("  nothing matches “{}” — press f to change the filter.", filter.label()),
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
-        for project in &tree.projects {
+        for project in tree.projects.iter().filter(|p| filter.keeps_project(p, now)) {
             let selected =
                 focused && app.claude_selected.as_deref() == Some(project.name.as_str());
             let start = lines.len() as u16;
-            append_claude_card(&mut lines, project, now, inner_width, selected);
+            append_claude_card(&mut lines, project, now, inner_width, selected, filter);
             lines.push(Line::from(""));
             if selected {
                 selected_extent = Some((start, lines.len() as u16 - start));
@@ -5524,6 +5680,7 @@ fn append_claude_card(
     now: u64,
     inner_width: usize,
     selected: bool,
+    filter: ClaudeFilter,
 ) {
     let accent = app_accent(&project.name);
     let live_n = project.sessions.iter().filter(|s| s.live.is_some()).count();
@@ -5578,14 +5735,19 @@ fn append_claude_card(
     // prompt count / branch / age (and live status) on the right edge.
     // Live sessions are always shown even past the recency cutoff, so a
     // project running many agents at once lists every one of them.
-    let top: Vec<&claude::SessionInfo> = project
+    let shown: Vec<&claude::SessionInfo> = project
         .sessions
         .iter()
+        .filter(|s| filter.matches(s, now))
+        .collect();
+    let top: Vec<&claude::SessionInfo> = shown
+        .iter()
+        .copied()
         .enumerate()
         .filter(|(i, s)| *i < CLAUDE_SESSIONS_SHOWN || s.live.is_some())
         .map(|(_, s)| s)
         .collect();
-    let extra = project.sessions.len().saturating_sub(top.len());
+    let extra = shown.len().saturating_sub(top.len());
     let tree_style = Style::default().fg(Color::DarkGray);
     for (i, session) in top.iter().enumerate() {
         let is_last = i == top.len() - 1 && extra == 0;
@@ -6531,6 +6693,149 @@ mod tests {
         // Clock skew on the transcript's mtime must not underflow.
         let now = 1_700_000_000;
         assert_eq!(claude_session_bullet(&session("a", "t", now + 500), now).0, "○");
+    }
+
+    fn live_session(id: &str, status: &str, last_activity: u64) -> claude::SessionInfo {
+        let mut s = session(id, "t", last_activity);
+        s.live = Some(claude::LiveSession {
+            pid: 1,
+            name: "n".to_string(),
+            status: status.to_string(),
+        });
+        s
+    }
+
+    #[test]
+    fn claude_filter_cycles_through_all_four_and_back() {
+        let mut f = ClaudeFilter::All;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            f = f.next();
+            seen.push(f);
+        }
+        assert_eq!(
+            seen,
+            [ClaudeFilter::Live, ClaudeFilter::Day, ClaudeFilter::Week, ClaudeFilter::All]
+        );
+    }
+
+    #[test]
+    fn claude_filter_matches_by_liveness_and_age() {
+        let now = 1_700_000_000;
+        let fresh = session("a", "t", now - 3_600);
+        let old = session("b", "t", now - 3 * 86_400);
+        let ancient = session("c", "t", now - 30 * 86_400);
+        let live_old = live_session("d", "idle", now - 30 * 86_400);
+
+        assert!(ClaudeFilter::All.matches(&ancient, now));
+        assert!(!ClaudeFilter::Live.matches(&fresh, now));
+        assert!(ClaudeFilter::Live.matches(&live_old, now));
+        assert!(ClaudeFilter::Day.matches(&fresh, now));
+        assert!(!ClaudeFilter::Day.matches(&old, now));
+        assert!(ClaudeFilter::Week.matches(&old, now));
+        assert!(!ClaudeFilter::Week.matches(&ancient, now));
+        // A future mtime must not underflow.
+        assert!(ClaudeFilter::Day.matches(&session("e", "t", now + 99), now));
+    }
+
+    fn project(name: &str, path: &str, sessions: Vec<claude::SessionInfo>) -> ProjectSessions {
+        ProjectSessions {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            last_activity: sessions.first().map(|s| s.last_activity),
+            sessions,
+            total_cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn claude_filter_keeps_only_projects_with_a_matching_session() {
+        let now = 1_700_000_000;
+        let quiet = project("quiet", "/w/quiet", vec![session("a", "t", now - 20 * 86_400)]);
+        let busy = project("busy", "/w/busy", vec![live_session("b", "busy", now)]);
+        assert!(ClaudeFilter::All.keeps_project(&quiet, now));
+        assert!(!ClaudeFilter::Live.keeps_project(&quiet, now));
+        assert!(ClaudeFilter::Live.keeps_project(&busy, now));
+    }
+
+    fn repo_at(path: &str) -> git::RepoSummary {
+        git::RepoSummary {
+            name: path.rsplit('/').next().unwrap().to_string(),
+            path: PathBuf::from(path),
+            most_recent_commit: None,
+            branches: Vec::new(),
+            is_dirty: false,
+            upstream_remote: None,
+            fork_drift: None,
+            commit_days: HashMap::new(),
+        }
+    }
+
+    fn git_tree_of(repos: Vec<git::RepoSummary>) -> GitTree {
+        GitTree {
+            root: PathBuf::from("/w"),
+            root_display: "/w".to_string(),
+            total_repos: repos.len(),
+            repos,
+            recent_commits: Vec::new(),
+            commit_days: HashMap::new(),
+            scanned_at: Instant::now(),
+        }
+    }
+
+    fn claude_tree_of(projects: Vec<ProjectSessions>) -> ClaudeTree {
+        ClaudeTree {
+            root: PathBuf::from("/w"),
+            root_display: "/w".to_string(),
+            total_sessions: projects.iter().map(|p| p.sessions.len()).sum(),
+            live_count: 0,
+            total_cost_usd: 0.0,
+            usage: claude::UsageSummary::default(),
+            projects,
+            scanned_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn repo_marker_counts_live_and_busy_sessions_per_repo() {
+        let git = git_tree_of(vec![repo_at("/w/alpha"), repo_at("/w/beta")]);
+        let claude = claude_tree_of(vec![
+            project(
+                "alpha",
+                "/w/alpha",
+                vec![live_session("a", "busy", 10), live_session("b", "idle", 10)],
+            ),
+            project("beta", "/w/beta", vec![session("c", "t", 10)]),
+        ]);
+        let map = claude_activity_by_repo(&git, Some(&claude));
+        assert_eq!(
+            map.get(&PathBuf::from("/w/alpha")),
+            Some(&RepoClaude { live: 2, busy: 1 })
+        );
+        // No live session, no entry.
+        assert!(!map.contains_key(&PathBuf::from("/w/beta")));
+    }
+
+    #[test]
+    fn repo_marker_attributes_a_subdirectory_session_to_the_deepest_repo() {
+        let git = git_tree_of(vec![repo_at("/w/mono"), repo_at("/w/mono/pkg")]);
+        let claude = claude_tree_of(vec![
+            project("pkg-src", "/w/mono/pkg/src", vec![live_session("a", "idle", 10)]),
+            project("mono-docs", "/w/mono/docs", vec![live_session("b", "busy", 10)]),
+            // A project outside every repo (e.g. `~`) is simply ignored.
+            project("home", "/Users/x", vec![live_session("c", "busy", 10)]),
+        ]);
+        let map = claude_activity_by_repo(&git, Some(&claude));
+        assert_eq!(
+            map.get(&PathBuf::from("/w/mono/pkg")),
+            Some(&RepoClaude { live: 1, busy: 0 })
+        );
+        assert_eq!(
+            map.get(&PathBuf::from("/w/mono")),
+            Some(&RepoClaude { live: 1, busy: 1 })
+        );
+        assert_eq!(map.len(), 2);
+        assert!(claude_activity_by_repo(&git, None).is_empty());
     }
 
     // -------------------- modal field navigation --------------------
