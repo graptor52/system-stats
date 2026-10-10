@@ -4,14 +4,6 @@ A terminal dashboard for developers on macOS and Linux. One window with up to fi
 
 No daemons, no root, no config beyond picking a directory to watch. Everything is read live from `git`, Claude Code's local session files, and the OS's own counters — `nettop`, `ioreg`, and `diskutil` on macOS; `/proc`, `/sys`, and `lsblk` on Linux.
 
-## Screenshots
-
-<!-- Drop images into docs/ and they'll render here. -->
-
-![Git Status tab](docs/screenshot-git.png)
-![Claude tab](docs/screenshot-claude.png)
-![Disk / Power tab](docs/screenshot-power.png)
-
 ## The tabs
 
 ### Git Status
