@@ -7,7 +7,8 @@
 //! publish a status file at `~/.claude/sessions/<pid>.json`.
 //!
 //! The scanner maps each directory under the watch dir to its transcript
-//! store, extracts a per-session summary (first typed prompt as the title,
+//! store (and sweeps up stores that belong to directories it can't reach,
+//! resolving their real path from the `cwd` in the transcripts), extracts a per-session summary (first typed prompt as the title,
 //! prompt count, git branch, last-activity mtime), and joins in the live
 //! registry by session id. Transcript parsing is cached by (mtime, size) so
 //! steady-state scans are just directory stats.
@@ -260,84 +261,84 @@ struct ParsedTranscript {
     models: Vec<(String, u32)>,
 }
 
+// How much of a transcript's head is searched for the project's real
+// working directory — the first record carrying `"cwd"` is normally within
+// the first few KB, but a leading file-history snapshot can be large.
+const CWD_PROBE_BYTES: u64 = 256 * 1024;
+
 fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
     let store_root = claude_dir().map(|d| d.join("projects"));
     let live = read_live_sessions();
 
     let mut projects: Vec<ProjectSessions> = Vec::new();
-    if let (Some(store_root), Ok(rd)) = (&store_root, fs::read_dir(root)) {
+    if let Some(store_root) = &store_root {
         let mut fresh: HashMap<PathBuf, CacheEntry> = HashMap::new();
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
-            else {
-                continue;
-            };
-            if !path.is_dir() || name.starts_with('.') {
-                continue;
-            }
-            let store = store_root.join(munge_path(&path));
-            let Ok(files) = fs::read_dir(&store) else { continue };
+        // Transcript stores already claimed by a directory under the watch
+        // dir, so the sweep below only sees what's left over.
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut taken_names: HashSet<String> = HashSet::new();
 
-            let mut sessions: Vec<SessionInfo> = Vec::new();
-            for f in files.flatten() {
-                let fpath = f.path();
-                if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let Some(id) = fpath
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
+        if let Ok(rd) = fs::read_dir(root) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
                 else {
                     continue;
                 };
-                let Ok(meta) = f.metadata() else { continue };
-                let Ok(mtime) = meta.modified() else { continue };
-                let len = meta.len();
-                let parsed = match cache.remove(&fpath) {
-                    Some(e) if e.mtime == mtime && e.len == len => e.parsed,
-                    _ => parse_transcript(&fpath),
-                };
-                fresh.insert(
-                    fpath.clone(),
-                    CacheEntry { mtime, len, parsed: parsed.clone() },
-                );
-                let last_activity = mtime
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                sessions.push(SessionInfo {
-                    live: live.get(&id).cloned(),
-                    id,
-                    title: pick_title(parsed.custom_title, parsed.ai_title, parsed.title),
-                    last_prompt: parsed.last_prompt,
-                    last_activity,
-                    prompt_count: parsed.prompt_count,
-                    git_branch: parsed.git_branch,
-                    duration_secs: parsed.duration_secs,
-                    output_tokens: parsed.output_tokens,
-                    cost_usd: parsed.cost_usd,
-                    tool_counts: parsed.tool_counts,
-                    models: parsed.models,
+                if !path.is_dir() || name.starts_with('.') {
+                    continue;
+                }
+                let store_name = munge_path(&path);
+                let store = store_root.join(&store_name);
+                let sessions = collect_sessions(&store, &live, cache, &mut fresh);
+                claimed.insert(store_name);
+                if let Some(p) = build_project(name.clone(), path, sessions) {
+                    taken_names.insert(name);
+                    projects.push(p);
+                }
+            }
+        }
+
+        // Sessions the watch-dir walk can't reach: the desktop app's scratch
+        // workspaces, sessions started from `~`, folders nested more than
+        // one level down, and projects outside the watch dir entirely. Each
+        // transcript store is keyed by a lossy munge of its path, so the
+        // real directory comes from the `cwd` recorded in the transcripts.
+        if let Ok(rd) = fs::read_dir(store_root) {
+            let mut stores: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| !claimed.contains(&n.to_string_lossy().into_owned()))
+                        .unwrap_or(false)
+                })
+                .collect();
+            // Deterministic naming when two stores resolve to the same label.
+            stores.sort();
+            for store in stores {
+                let sessions = collect_sessions(&store, &live, cache, &mut fresh);
+                if sessions.is_empty() {
+                    continue;
+                }
+                let dir = project_dir_from_store(&store).unwrap_or_else(|| {
+                    // No cwd found — the best remaining label is the munged
+                    // store name itself; `$HOME` keeps actions harmless.
+                    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
                 });
+                let label = project_label(&dir, root, &store);
+                let mut name = label.clone();
+                if taken_names.contains(&name) {
+                    name = format!("{label} ({})", config::display_path(&dir));
+                }
+                if !taken_names.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(p) = build_project(name, dir, sessions) {
+                    projects.push(p);
+                }
             }
-            if sessions.is_empty() {
-                continue;
-            }
-            sessions.sort_by(|a, b| {
-                b.last_activity
-                    .cmp(&a.last_activity)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            let last_activity = sessions.iter().map(|s| s.last_activity).max();
-            let total_cost_usd = sessions.iter().map(|s| s.cost_usd).sum();
-            projects.push(ProjectSessions {
-                name,
-                path,
-                sessions,
-                last_activity,
-                total_cost_usd,
-            });
         }
         // Entries for deleted transcripts (or a changed root) fall away here.
         *cache = fresh;
@@ -365,6 +366,126 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
         total_cost_usd,
         scanned_at: Instant::now(),
     }
+}
+
+// Every session in one transcript store directory, newest first. Parsing
+// goes through `cache` (keyed by file, validated by mtime + size); each file
+// seen is re-inserted into `fresh` so unused entries age out.
+fn collect_sessions(
+    store: &Path,
+    live: &HashMap<String, LiveSession>,
+    cache: &mut HashMap<PathBuf, CacheEntry>,
+    fresh: &mut HashMap<PathBuf, CacheEntry>,
+) -> Vec<SessionInfo> {
+    let Ok(files) = fs::read_dir(store) else { return Vec::new() };
+    let mut sessions: Vec<SessionInfo> = Vec::new();
+    for f in files.flatten() {
+        let fpath = f.path();
+        if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(id) = fpath.file_stem().map(|s| s.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let Ok(meta) = f.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let len = meta.len();
+        let parsed = match cache.remove(&fpath) {
+            Some(e) if e.mtime == mtime && e.len == len => e.parsed,
+            _ => parse_transcript(&fpath),
+        };
+        fresh.insert(fpath.clone(), CacheEntry { mtime, len, parsed: parsed.clone() });
+        let last_activity = mtime
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        sessions.push(SessionInfo {
+            live: live.get(&id).cloned(),
+            id,
+            title: pick_title(parsed.custom_title, parsed.ai_title, parsed.title),
+            last_prompt: parsed.last_prompt,
+            last_activity,
+            prompt_count: parsed.prompt_count,
+            git_branch: parsed.git_branch,
+            duration_secs: parsed.duration_secs,
+            output_tokens: parsed.output_tokens,
+            cost_usd: parsed.cost_usd,
+            tool_counts: parsed.tool_counts,
+            models: parsed.models,
+        });
+    }
+    sessions.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sessions
+}
+
+// None for a project with no sessions — nothing to list.
+fn build_project(
+    name: String,
+    path: PathBuf,
+    sessions: Vec<SessionInfo>,
+) -> Option<ProjectSessions> {
+    if sessions.is_empty() {
+        return None;
+    }
+    let last_activity = sessions.iter().map(|s| s.last_activity).max();
+    let total_cost_usd = sessions.iter().map(|s| s.cost_usd).sum();
+    Some(ProjectSessions { name, path, sessions, last_activity, total_cost_usd })
+}
+
+// The working directory a transcript store belongs to, from the first
+// `"cwd"` found in its most recently modified transcript's head.
+fn project_dir_from_store(store: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut files: Vec<(SystemTime, PathBuf)> = fs::read_dir(store)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files {
+        let Ok(file) = fs::File::open(&path) else { continue };
+        let mut buf = Vec::new();
+        if file.take(CWD_PROBE_BYTES).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if let Some(cwd) = json_str(&String::from_utf8_lossy(&buf), "cwd") {
+            if !cwd.is_empty() {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
+}
+
+// Display label for a project found outside the watch-dir walk: the path
+// relative to the watch dir when it lives under it, otherwise `~`-relative,
+// shortened to its last two components when long.
+fn project_label(dir: &Path, root: &Path, store: &Path) -> String {
+    if let Ok(rel) = dir.strip_prefix(root) {
+        let rel = rel.display().to_string();
+        if !rel.is_empty() {
+            return rel;
+        }
+    }
+    if dir.as_os_str().is_empty() {
+        return store
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    let shown = config::display_path(dir);
+    if shown.chars().count() <= 40 {
+        return shown;
+    }
+    let parts: Vec<_> = dir.components().rev().take(2).collect();
+    let tail: PathBuf = parts.into_iter().rev().collect();
+    format!("…/{}", tail.display())
 }
 
 fn claude_dir() -> Option<PathBuf> {
@@ -1559,5 +1680,53 @@ mod tests {
         let p = parse_transcript_text(line);
         // 3 in × $5 + 1M 1h-write × 2 × $5 = $10.000015
         assert!((p.cost_usd - 10.000015).abs() < 1e-9, "got {}", p.cost_usd);
+    }
+
+    #[test]
+    fn labels_are_relative_to_the_watch_dir_when_nested_under_it() {
+        let root = Path::new("/Users/me/code");
+        let store = Path::new("/h/.claude/projects/-x");
+        assert_eq!(
+            project_label(Path::new("/Users/me/code/site.io/PTO"), root, store),
+            "site.io/PTO"
+        );
+    }
+
+    #[test]
+    fn long_outside_paths_keep_only_their_last_two_components() {
+        let root = Path::new("/Users/me/code");
+        let store = Path::new("/h/.claude/projects/-x");
+        let long = Path::new(
+            "/opt/some/very/long/application/support/path/scratch/2026-10-09-abcdef",
+        );
+        assert_eq!(project_label(long, root, store), "…/scratch/2026-10-09-abcdef");
+        // Short ones show in full.
+        assert_eq!(project_label(Path::new("/opt/app"), root, store), "/opt/app");
+        // No known directory: fall back to the store's own name.
+        assert_eq!(project_label(Path::new(""), root, store), "-x");
+    }
+
+    #[test]
+    fn project_dir_comes_from_the_cwd_in_a_transcript() {
+        let dir = std::env::temp_dir().join(format!("ss-cwd-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"mode","mode":"normal","sessionId":"s1"}"#,
+                "\n",
+                r#"{"type":"user","cwd":"/Users/me/code/a.b/PTO","message":{"content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            project_dir_from_store(&dir),
+            Some(PathBuf::from("/Users/me/code/a.b/PTO"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+        // A store with no transcripts resolves to nothing.
+        assert_eq!(project_dir_from_store(&dir), None);
     }
 }
