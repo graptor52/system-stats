@@ -89,6 +89,9 @@ pub struct SessionInfo {
     // count, most-used first. Usually one entry; more when the session
     // mixed models (subagents, /model switches, fallbacks).
     pub models: Vec<(String, u32)>,
+    // Which client wrote the transcript, as Claude Code records it:
+    // "cli", "claude-desktop", … Empty when the transcript doesn't say.
+    pub entrypoint: String,
     // Present when a running Claude Code process owns this session.
     pub live: Option<LiveSession>,
 }
@@ -259,6 +262,7 @@ struct ParsedTranscript {
     cost_usd: f64,
     tool_counts: Vec<(String, u32)>,
     models: Vec<(String, u32)>,
+    entrypoint: String,
 }
 
 // How much of a transcript's head is searched for the project's real
@@ -413,6 +417,7 @@ fn collect_sessions(
             cost_usd: parsed.cost_usd,
             tool_counts: parsed.tool_counts,
             models: parsed.models,
+            entrypoint: parsed.entrypoint,
         });
     }
     sessions.sort_by(|a, b| {
@@ -978,6 +983,11 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
             }
             last_ts = Some(ts);
         }
+        if out.entrypoint.is_empty() {
+            if let Some(e) = json_str(line, "entrypoint") {
+                out.entrypoint = e;
+            }
+        }
         if let Some(b) = json_str(line, "gitBranch") {
             if !b.is_empty() {
                 out.git_branch = Some(b);
@@ -1047,7 +1057,7 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
                     continue;
                 };
                 if seen_tool_ids.insert(id) {
-                    *tool_counts.entry(name).or_insert(0) += 1;
+                    *tool_counts.entry(short_tool_name(&name)).or_insert(0) += 1;
                 }
             }
             continue;
@@ -1096,6 +1106,25 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.tool_counts = counts;
     out
+}
+
+// MCP tools are named `mcp__<server>__<tool>`; counted raw they'd fill the
+// tool mix with one long, unreadable entry per tool. Fold them per server
+// as `mcp:<server>`, dropping connector prefixes (`claude_ai_`,
+// `plugin_<name>_`) and shortening uuid-named servers.
+fn short_tool_name(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("mcp__") else { return name.to_string() };
+    let server = rest.split("__").next().unwrap_or(rest);
+    let server = if let Some(s) = server.strip_prefix("claude_ai_") {
+        s
+    } else if let Some(s) = server.strip_prefix("plugin_") {
+        s.split_once('_').map(|(_, tail)| tail).unwrap_or(s)
+    } else {
+        server
+    };
+    let is_uuid = server.len() >= 32 && server.chars().filter(|c| *c == '-').count() == 4;
+    let server = if is_uuid { &server[..8] } else { server };
+    format!("mcp:{server}")
 }
 
 // The API message id ("id":"msg_…") that a re-written assistant record
@@ -1422,6 +1451,35 @@ mod tests {
         assert_eq!(pick_title(s(""), s("gen"), s("first")), "gen");
         assert_eq!(pick_title(s(""), s(""), s("first")), "first");
         assert_eq!(pick_title(s(""), s(""), s("")), "");
+    }
+
+    #[test]
+    fn mcp_tool_names_fold_per_server() {
+        assert_eq!(short_tool_name("Bash"), "Bash");
+        assert_eq!(short_tool_name("mcp__Claude_Browser__navigate"), "mcp:Claude_Browser");
+        assert_eq!(short_tool_name("mcp__claude_ai_Airtable__list_bases"), "mcp:Airtable");
+        assert_eq!(
+            short_tool_name("mcp__plugin_operations_atlassian__authenticate"),
+            "mcp:atlassian"
+        );
+        assert_eq!(
+            short_tool_name("mcp__9b803393-ea95-4fb0-b9d5-47e27eb5c7e5__search"),
+            "mcp:9b803393"
+        );
+    }
+
+    #[test]
+    fn entrypoint_is_taken_from_the_first_record_that_has_one() {
+        let text = concat!(
+            r#"{"type":"mode","mode":"normal"}"#,
+            "\n",
+            r#"{"type":"user","entrypoint":"claude-desktop","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"user","entrypoint":"cli","message":{"content":"again"}}"#,
+            "\n",
+        );
+        assert_eq!(parse_transcript_text(text).entrypoint, "claude-desktop");
+        assert_eq!(parse_transcript_text(RICH_TRANSCRIPT).entrypoint, "");
     }
 
     #[test]

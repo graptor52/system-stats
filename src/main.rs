@@ -5259,6 +5259,17 @@ fn claude_session_title(session: &claude::SessionInfo) -> String {
     format!("session {short}")
 }
 
+// Which client a session came from, for the row badge. Claude Code records
+// the CLI as "cli" and the desktop app as "claude-desktop"; anything else
+// (including transcripts that don't say) shows no badge rather than a guess.
+fn claude_origin_label(entrypoint: &str) -> Option<&'static str> {
+    match entrypoint {
+        "cli" => Some("cli"),
+        "claude-desktop" => Some("desktop"),
+        _ => None,
+    }
+}
+
 fn draw_claude(f: &mut Frame, app: &App, area: Rect) {
     let Some(tree) = &app.claude_tree else {
         let msg = format!("scanning {} …", config::display_path(&app.config.watch_dir));
@@ -5437,6 +5448,9 @@ fn append_claude_card(
             session.prompt_count,
             if session.prompt_count == 1 { "" } else { "s" },
         );
+        if let Some(origin) = claude_origin_label(&session.entrypoint) {
+            meta.push_str(&format!(" · {origin}"));
+        }
         if let Some(branch) = &session.git_branch {
             meta.push_str(&format!(" · {branch}"));
         }
@@ -5571,6 +5585,9 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
             session.prompt_count,
             if session.prompt_count == 1 { "" } else { "s" },
         );
+        if let Some(origin) = claude_origin_label(&session.entrypoint) {
+            meta.push_str(&format!(" · {origin}"));
+        }
         if let Some(branch) = &session.git_branch {
             meta.push_str(&format!(" · {branch}"));
         }
@@ -5695,6 +5712,14 @@ mod tests {
 
     fn key_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn origin_label_names_known_clients_only() {
+        assert_eq!(claude_origin_label("cli"), Some("cli"));
+        assert_eq!(claude_origin_label("claude-desktop"), Some("desktop"));
+        assert_eq!(claude_origin_label("sdk-ts"), None);
+        assert_eq!(claude_origin_label(""), None);
     }
 
     // -------------------- refresh keys --------------------
@@ -6290,6 +6315,7 @@ mod tests {
             output_tokens: 0,
             cost_usd: 0.0,
             tool_counts: Vec::new(),
+            entrypoint: String::new(),
             models: Vec::new(),
             live: None,
         }
