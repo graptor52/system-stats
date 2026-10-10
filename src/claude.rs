@@ -218,6 +218,15 @@ fn model_rates(model: &str) -> (f64, f64) {
     (5.0, 25.0)
 }
 
+// Title precedence: a name the user chose, then Claude Code's generated
+// title, then the first prompt (all older transcripts have).
+fn pick_title(custom: String, generated: String, first_prompt: String) -> String {
+    [custom, generated, first_prompt]
+        .into_iter()
+        .find(|t| !t.is_empty())
+        .unwrap_or_default()
+}
+
 fn usage_cost(model: &str, u: &MsgUsage) -> f64 {
     let (input_rate, output_rate) = model_rates(model);
     let write_1h = u.cache_write_1h.min(u.cache_write);
@@ -237,6 +246,10 @@ struct ParsedTranscript {
     // Claude Code's own generated title; appended repeatedly as the
     // conversation evolves, so the last occurrence wins.
     ai_title: String,
+    // A name the user set (`/rename`, or naming a desktop session). Wins
+    // over the generated title; renames append a new record, so the last
+    // occurrence wins here too.
+    custom_title: String,
     last_prompt: String,
     prompt_count: usize,
     git_branch: Option<String>,
@@ -296,13 +309,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
                 sessions.push(SessionInfo {
                     live: live.get(&id).cloned(),
                     id,
-                    // Prefer the generated title; older transcripts only
-                    // have the first prompt to go on.
-                    title: if parsed.ai_title.is_empty() {
-                        parsed.title
-                    } else {
-                        parsed.ai_title
-                    },
+                    title: pick_title(parsed.custom_title, parsed.ai_title, parsed.title),
                     last_prompt: parsed.last_prompt,
                     last_activity,
                     prompt_count: parsed.prompt_count,
@@ -864,6 +871,15 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
             }
             continue;
         }
+        if line.contains("\"type\":\"custom-title\"") {
+            if let Some(t) = json_str(line, "customTitle") {
+                let collapsed = collapse_ws(&t);
+                if !collapsed.is_empty() {
+                    out.custom_title = collapsed;
+                }
+            }
+            continue;
+        }
         if line.contains("\"type\":\"last-prompt\"") {
             if let Some(t) = json_str(line, "lastPrompt") {
                 let collapsed = collapse_ws(&t);
@@ -1255,6 +1271,36 @@ mod tests {
         assert_eq!(p.ai_title, "Build the thing end to end");
         assert_eq!(p.title, "build the thing"); // fallback still captured
         assert_eq!(p.last_prompt, "now polish it");
+    }
+
+    #[test]
+    fn custom_title_is_captured_and_outranks_the_generated_one() {
+        let text = concat!(
+            r#"{"type":"ai-title","aiTitle":"Generated name","sessionId":"abc"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Old name","sessionId":"abc"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Burgnon.com  subdomain structure","sessionId":"abc"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"Burgnon.com subdomain structure","sessionId":"abc"}"#,
+            "\n",
+        );
+        let p = parse_transcript_text(text);
+        // Last rename wins, whitespace collapsed.
+        assert_eq!(p.custom_title, "Burgnon.com subdomain structure");
+        assert_eq!(p.ai_title, "Generated name");
+        assert_eq!(
+            pick_title(p.custom_title, p.ai_title, p.title),
+            "Burgnon.com subdomain structure"
+        );
+    }
+
+    #[test]
+    fn title_falls_back_through_generated_to_first_prompt() {
+        let s = |x: &str| x.to_string();
+        assert_eq!(pick_title(s(""), s("gen"), s("first")), "gen");
+        assert_eq!(pick_title(s(""), s(""), s("first")), "first");
+        assert_eq!(pick_title(s(""), s(""), s("")), "");
     }
 
     #[test]
