@@ -5348,7 +5348,103 @@ fn draw_claude(f: &mut Frame, app: &App, area: Rect) {
     draw_claude_list(f, app, tree, area);
 }
 
+// Rows the usage strip needs: two lines of content plus the border.
+const USAGE_STRIP_HEIGHT: u16 = 4;
+// Below this the project list matters more than the strip.
+const USAGE_STRIP_MIN_AREA: u16 = 16;
+
+// One block glyph per value, scaled to the largest; a day with no spend
+// shows as a dot so a gap reads as "quiet" rather than "missing".
+fn usage_bars(values: &[f64]) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().cloned().fold(0.0_f64, f64::max);
+    values
+        .iter()
+        .map(|v| {
+            if *v <= 0.0 || max <= 0.0 {
+                '·'
+            } else {
+                let i = ((v / max) * (LEVELS.len() - 1) as f64).round() as usize;
+                LEVELS[i.min(LEVELS.len() - 1)]
+            }
+        })
+        .collect()
+}
+
+// "opus 82% · sonnet 18%" from per-family spend; empty when there's none.
+fn usage_model_split(models: &[(String, f64)]) -> String {
+    let total: f64 = models.iter().map(|(_, c)| c).sum();
+    if total <= 0.0 {
+        return String::new();
+    }
+    models
+        .iter()
+        .take(3)
+        .map(|(m, c)| format!("{m} {:.0}%", c / total * 100.0))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn draw_claude_usage(f: &mut Frame, usage: &claude::UsageSummary, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let label = Style::default().fg(Color::Gray);
+    let window = |name: &str, t: &claude::UsageTotals| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!("{name} "), dim),
+            Span::styled(format_cost(t.cost_usd), label.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" · {} out", format_tokens(t.output_tokens).replace(" tok", "")),
+                dim,
+            ),
+            Span::raw("    "),
+        ]
+    };
+    let mut totals: Vec<Span<'static>> = vec![Span::raw("  ")];
+    totals.extend(window("5h", &usage.last_5h));
+    totals.extend(window("24h", &usage.last_24h));
+    totals.extend(window("7d", &usage.last_7d));
+
+    let peak = usage.daily_cost.iter().cloned().fold(0.0_f64, f64::max);
+    let mut trend: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let split = usage_model_split(&usage.models_7d);
+    if !split.is_empty() {
+        trend.push(Span::styled(split, label));
+        trend.push(Span::raw("    "));
+    }
+    trend.push(Span::styled(format!("{}d ", usage.daily_cost.len()), dim));
+    trend.push(Span::styled(
+        usage_bars(&usage.daily_cost),
+        Style::default().fg(Color::Cyan),
+    ));
+    if peak > 0.0 {
+        trend.push(Span::styled(format!("  peak {}/day", format_cost(peak)), dim));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(dim)
+        .style(Style::reset())
+        .title(" Usage · API-equivalent estimate, rolling windows ");
+    let para = Paragraph::new(vec![Line::from(totals), Line::from(trend)])
+        .style(Style::reset())
+        .block(block);
+    f.render_widget(para, area);
+}
+
 fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
+    // The usage strip sits above the list, fixed, when there's room and
+    // anything to report.
+    let area = if area.height >= USAGE_STRIP_MIN_AREA && tree.usage.last_7d.cost_usd > 0.0 {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(USAGE_STRIP_HEIGHT), Constraint::Min(0)])
+            .split(area);
+        draw_claude_usage(f, &tree.usage, parts[0]);
+        parts[1]
+    } else {
+        area
+    };
     let focused = app.focus == Focus::Right;
     // Round to 5-second increments so the title doesn't flicker every tick.
     let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
@@ -5765,6 +5861,20 @@ mod tests {
 
     fn key_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn usage_bars_scale_to_the_peak_and_mark_quiet_days() {
+        assert_eq!(usage_bars(&[0.0, 1.0, 8.0]), "·▂█");
+        assert_eq!(usage_bars(&[0.0, 0.0]), "··");
+        assert_eq!(usage_bars(&[]), "");
+    }
+
+    #[test]
+    fn model_split_is_percent_of_spend() {
+        let m = vec![("opus".to_string(), 8.0), ("sonnet".to_string(), 2.0)];
+        assert_eq!(usage_model_split(&m), "opus 80% · sonnet 20%");
+        assert_eq!(usage_model_split(&[]), "");
     }
 
     #[test]

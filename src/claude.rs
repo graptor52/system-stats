@@ -37,6 +37,35 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(10);
 // what we keep in memory per session.
 const TITLE_MAX_CHARS: usize = 120;
 
+// Granularity of the usage history. Small enough that the 5-hour window is
+// accurate to ~10 minutes, large enough to keep per-session data tiny.
+const USAGE_SLOT_SECS: u64 = 600;
+const USAGE_WINDOW_5H: u64 = 5 * 3600;
+const USAGE_WINDOW_24H: u64 = 24 * 3600;
+const USAGE_WINDOW_7D: u64 = 7 * 24 * 3600;
+// Days shown in the bar chart (each bar is one rolling 24h block).
+pub const USAGE_DAYS: usize = 14;
+
+// Spend and output tokens over some window. Cost is the same API-equivalent
+// estimate shown per session.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct UsageTotals {
+    pub cost_usd: f64,
+    pub output_tokens: u64,
+}
+
+// Everything the usage strip shows, across all sessions found.
+#[derive(Clone, Default)]
+pub struct UsageSummary {
+    pub last_5h: UsageTotals,
+    pub last_24h: UsageTotals,
+    pub last_7d: UsageTotals,
+    // Cost per rolling 24h block, oldest first; USAGE_DAYS entries.
+    pub daily_cost: Vec<f64>,
+    // Cost over the last 7 days by model family, biggest first.
+    pub models_7d: Vec<(String, f64)>,
+}
+
 pub struct ClaudeTree {
     // The watch dir this tree was scanned from — same stale-root guard as
     // GitTree, so a scan in flight across a settings change gets dropped.
@@ -46,6 +75,7 @@ pub struct ClaudeTree {
     pub total_sessions: usize,
     pub live_count: usize,
     pub total_cost_usd: f64,
+    pub usage: UsageSummary,
     pub scanned_at: Instant,
 }
 
@@ -263,7 +293,13 @@ struct ParsedTranscript {
     tool_counts: Vec<(String, u32)>,
     models: Vec<(String, u32)>,
     entrypoint: String,
+    // (slot, model, cost, output tokens): where in time the session's
+    // spend landed. Slot = epoch seconds / USAGE_SLOT_SECS.
+    usage_slots: Vec<(u64, String, f64, u64)>,
 }
+
+// slot + model family → (cost, output tokens), across every session.
+type UsageSlots = HashMap<(u64, String), (f64, u64)>;
 
 // How much of a transcript's head is searched for the project's real
 // working directory — the first record carrying `"cwd"` is normally within
@@ -275,6 +311,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
     let live = read_live_sessions();
 
     let mut projects: Vec<ProjectSessions> = Vec::new();
+    let mut usage_slots: UsageSlots = HashMap::new();
     if let Some(store_root) = &store_root {
         let mut fresh: HashMap<PathBuf, CacheEntry> = HashMap::new();
         // Transcript stores already claimed by a directory under the watch
@@ -294,7 +331,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
                 }
                 let store_name = munge_path(&path);
                 let store = store_root.join(&store_name);
-                let sessions = collect_sessions(&store, &live, cache, &mut fresh);
+                let sessions = collect_sessions(&store, &live, cache, &mut fresh, &mut usage_slots);
                 claimed.insert(store_name);
                 if let Some(p) = build_project(name.clone(), path, sessions) {
                     taken_names.insert(name);
@@ -322,7 +359,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
             // Deterministic naming when two stores resolve to the same label.
             stores.sort();
             for store in stores {
-                let sessions = collect_sessions(&store, &live, cache, &mut fresh);
+                let sessions = collect_sessions(&store, &live, cache, &mut fresh, &mut usage_slots);
                 if sessions.is_empty() {
                     continue;
                 }
@@ -361,6 +398,12 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
         .count();
     let total_cost_usd = projects.iter().map(|p| p.total_cost_usd).sum();
 
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let usage = summarize_usage(&usage_slots, now_secs);
+
     ClaudeTree {
         root: root.to_path_buf(),
         root_display: config::display_path(root),
@@ -368,8 +411,63 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
         total_sessions,
         live_count,
         total_cost_usd,
+        usage,
         scanned_at: Instant::now(),
     }
+}
+
+// "claude-opus-5-5" → "opus". Unknown ids group as "other" so a future
+// family still shows up in totals even without its own label.
+fn model_family(model: &str) -> String {
+    for family in ["fable", "mythos", "opus", "sonnet", "haiku"] {
+        if model.contains(family) {
+            return family.to_string();
+        }
+    }
+    "other".to_string()
+}
+
+// Fold the slot map into the strip's numbers. Windows are rolling and end
+// at `now`, so no timezone is involved: "24h" is the last 24 hours, not
+// "today", and bar N back is the N-th 24h block before now.
+fn summarize_usage(slots: &UsageSlots, now: u64) -> UsageSummary {
+    let mut out = UsageSummary { daily_cost: vec![0.0; USAGE_DAYS], ..Default::default() };
+    let mut by_model: HashMap<String, f64> = HashMap::new();
+    for ((slot, family), (cost, tokens)) in slots {
+        // Age of the slot's end, so a slot straddling the window edge
+        // counts while any part of it is inside.
+        let slot_end = (slot + 1) * USAGE_SLOT_SECS;
+        let age = now.saturating_sub(slot_end.saturating_sub(1));
+        let add = |t: &mut UsageTotals| {
+            t.cost_usd += cost;
+            t.output_tokens += tokens;
+        };
+        if age < USAGE_WINDOW_5H {
+            add(&mut out.last_5h);
+        }
+        if age < USAGE_WINDOW_24H {
+            add(&mut out.last_24h);
+        }
+        if age < USAGE_WINDOW_7D {
+            add(&mut out.last_7d);
+            *by_model.entry(family.clone()).or_insert(0.0) += cost;
+        }
+        // Bars bucket by the slot's start so a block boundary never pulls
+        // a slot into the newer bar.
+        let age_start = now.saturating_sub(slot * USAGE_SLOT_SECS);
+        let day = (age_start / USAGE_WINDOW_24H) as usize;
+        if day < USAGE_DAYS {
+            // Oldest first, so the newest block is the last entry.
+            out.daily_cost[USAGE_DAYS - 1 - day] += cost;
+        }
+    }
+    let mut models: Vec<(String, f64)> =
+        by_model.into_iter().filter(|(_, c)| *c > 0.0).collect();
+    models.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+    });
+    out.models_7d = models;
+    out
 }
 
 // Every session in one transcript store directory, newest first. Parsing
@@ -380,6 +478,7 @@ fn collect_sessions(
     live: &HashMap<String, LiveSession>,
     cache: &mut HashMap<PathBuf, CacheEntry>,
     fresh: &mut HashMap<PathBuf, CacheEntry>,
+    usage: &mut UsageSlots,
 ) -> Vec<SessionInfo> {
     let Ok(files) = fs::read_dir(store) else { return Vec::new() };
     let mut sessions: Vec<SessionInfo> = Vec::new();
@@ -399,6 +498,11 @@ fn collect_sessions(
             Some(e) if e.mtime == mtime && e.len == len => e.parsed,
             _ => parse_transcript(&fpath),
         };
+        for (slot, model, cost, tokens) in &parsed.usage_slots {
+            let e = usage.entry((*slot, model_family(model))).or_default();
+            e.0 += cost;
+            e.1 += tokens;
+        }
         fresh.insert(fpath.clone(), CacheEntry { mtime, len, parsed: parsed.clone() });
         let last_activity = mtime
             .duration_since(UNIX_EPOCH)
@@ -968,7 +1072,9 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
     // carrying the same message id and a usage snapshot — summing lines
     // naively would count one message several times over. Dedupe by
     // message id (last snapshot wins) and by tool-use id.
-    let mut usage_by_msg: HashMap<String, (String, MsgUsage)> = HashMap::new();
+    let mut usage_by_msg: HashMap<String, (String, MsgUsage, Option<u64>)> =
+        HashMap::new();
+    let mut stray_slots: HashMap<(u64, String), (f64, u64)> = HashMap::new();
     let mut stray_tokens: u64 = 0;
     let mut stray_cost: f64 = 0.0;
     let mut seen_tool_ids: HashSet<String> = HashSet::new();
@@ -977,7 +1083,8 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
     let mut last_ts: Option<u64> = None;
 
     for line in text.lines() {
-        if let Some(ts) = extract_timestamp(line) {
+        let line_ts = extract_timestamp(line);
+        if let Some(ts) = line_ts {
             if first_ts.is_none() {
                 first_ts = Some(ts);
             }
@@ -1038,11 +1145,25 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
                 let model = json_str(line, "model").unwrap_or_default();
                 match message_id(line) {
                     Some(id) => {
-                        usage_by_msg.insert(id, (model, usage));
+                        // The message's time is when it first appeared;
+                        // later snapshots only refine the usage.
+                        let ts = usage_by_msg
+                            .get(&id)
+                            .and_then(|(_, _, t)| *t)
+                            .or(line_ts);
+                        usage_by_msg.insert(id, (model, usage, ts));
                     }
                     None => {
                         stray_tokens += usage.output;
-                        stray_cost += usage_cost(&model, &usage);
+                        let cost = usage_cost(&model, &usage);
+                        stray_cost += cost;
+                        if let Some(ts) = line_ts {
+                            let e = stray_slots
+                                .entry((ts / USAGE_SLOT_SECS, model))
+                                .or_default();
+                            e.0 += cost;
+                            e.1 += usage.output;
+                        }
                     }
                 }
             }
@@ -1088,13 +1209,24 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
     out.output_tokens = stray_tokens;
     out.cost_usd = stray_cost;
     let mut model_counts: HashMap<String, u32> = HashMap::new();
-    for (model, usage) in usage_by_msg.values() {
+    let mut slots = stray_slots;
+    for (model, usage, ts) in usage_by_msg.values() {
         out.output_tokens += usage.output;
-        out.cost_usd += usage_cost(model, usage);
+        let cost = usage_cost(model, usage);
+        out.cost_usd += cost;
+        if let Some(ts) = ts {
+            let e = slots.entry((ts / USAGE_SLOT_SECS, model.clone())).or_default();
+            e.0 += cost;
+            e.1 += usage.output;
+        }
         if !model.is_empty() {
             *model_counts.entry(model.clone()).or_insert(0) += 1;
         }
     }
+    out.usage_slots = slots
+        .into_iter()
+        .map(|((slot, model), (cost, tokens))| (slot, model, cost, tokens))
+        .collect();
     let mut models: Vec<(String, u32)> = model_counts.into_iter().collect();
     models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.models = models;
@@ -1786,5 +1918,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         // A store with no transcripts resolves to nothing.
         assert_eq!(project_dir_from_store(&dir), None);
+    }
+
+    #[test]
+    fn messages_land_in_time_slots_by_first_appearance() {
+        let text = concat!(
+            // msg A first appears at 00:00:30, is re-written at 00:20:00;
+            // it stays in the first slot with its final usage.
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_01A","content":[],"usage":{"input_tokens":0,"output_tokens":10}},"timestamp":"2026-10-01T00:00:30.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_01A","content":[],"usage":{"input_tokens":0,"output_tokens":40}},"timestamp":"2026-10-01T00:20:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_01B","content":[],"usage":{"input_tokens":0,"output_tokens":5}},"timestamp":"2026-10-01T02:00:00.000Z"}"#,
+            "\n",
+        );
+        let p = parse_transcript_text(text);
+        let t0 = parse_iso_secs("2026-10-01T00:00:30.000Z").unwrap() / USAGE_SLOT_SECS;
+        let t1 = parse_iso_secs("2026-10-01T02:00:00.000Z").unwrap() / USAGE_SLOT_SECS;
+        let mut slots = p.usage_slots.clone();
+        slots.sort_by_key(|s| s.0);
+        assert_eq!(slots.len(), 2);
+        assert_eq!((slots[0].0, slots[0].1.as_str(), slots[0].3), (t0, "claude-opus-5-5", 40));
+        assert_eq!((slots[1].0, slots[1].1.as_str(), slots[1].3), (t1, "claude-sonnet-5-5", 5));
+        let total: f64 = slots.iter().map(|s| s.2).sum();
+        assert!((total - p.cost_usd).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model_families_group_by_name() {
+        assert_eq!(model_family("claude-opus-5-5"), "opus");
+        assert_eq!(model_family("claude-sonnet-4-6"), "sonnet");
+        assert_eq!(model_family("claude-3-5-haiku-20241022"), "haiku");
+        assert_eq!(model_family("<synthetic>"), "other");
+    }
+
+    #[test]
+    fn usage_windows_roll_back_from_now() {
+        let now: u64 = 1_800_000_000;
+        let slot_at = |secs_ago: u64| (now - secs_ago) / USAGE_SLOT_SECS;
+        let mut slots: UsageSlots = HashMap::new();
+        // 1h ago (all windows), 6h ago (24h+), 3 days ago (7d), 20 days ago (none).
+        slots.insert((slot_at(3600), "opus".into()), (1.0, 100));
+        slots.insert((slot_at(6 * 3600), "sonnet".into()), (2.0, 200));
+        slots.insert((slot_at(3 * 86_400), "opus".into()), (4.0, 400));
+        slots.insert((slot_at(20 * 86_400), "opus".into()), (8.0, 800));
+        let u = summarize_usage(&slots, now);
+        assert_eq!(u.last_5h, UsageTotals { cost_usd: 1.0, output_tokens: 100 });
+        assert_eq!(u.last_24h, UsageTotals { cost_usd: 3.0, output_tokens: 300 });
+        assert_eq!(u.last_7d, UsageTotals { cost_usd: 7.0, output_tokens: 700 });
+        // Newest block last: 3.0 in the last 24h, 4.0 in block 3 days back.
+        assert_eq!(u.daily_cost.len(), USAGE_DAYS);
+        assert!((u.daily_cost[USAGE_DAYS - 1] - 3.0).abs() < 1e-9);
+        assert!((u.daily_cost[USAGE_DAYS - 1 - 3] - 4.0).abs() < 1e-9);
+        // Model split covers 7 days only, biggest first.
+        assert_eq!(u.models_7d, vec![("opus".to_string(), 5.0), ("sonnet".to_string(), 2.0)]);
     }
 }
