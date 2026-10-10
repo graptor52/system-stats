@@ -28,8 +28,10 @@ Points at a single "watch directory" (e.g. `~/Documents/code`) and scans every r
 
 Maps each project under the watch directory to its Claude Code session history (`~/.claude/projects/`):
 
-- Every session with its AI-generated title, prompt count, git branch, and age; **live sessions** show a green busy/idle badge and the prompt they're currently working on
-- Per-session stats: wall-clock duration, output tokens, which model(s) ran it, a tool-mix profile (`59 Edit · 58 Bash` reads as a build session; `15 WebSearch` as research), and an **API-equivalent cost estimate** (`~$23`) — notional if you're on a subscription plan, computed per message at published API rates
+- A **usage strip** above the list: API-equivalent spend and output tokens for the last 5 hours, 24 hours, and 7 days (rolling windows), a per-model split, and a 14-day bar chart. It hides itself on short terminals (under 16 rows) or when there's no recent spend
+- Every session with its title (a name you set with `/rename` wins over the AI-generated one), a `cli`/`desktop` badge for which client wrote it, prompt count, git branch, and age; **live sessions** show a green busy/idle badge and the prompt they're currently working on
+- **Sessions outside the watch directory** (the desktop app's scratch workspaces, sessions started in `~`, nested folders) are listed too, found via `~/.claude/projects/`
+- Per-session stats: wall-clock duration, output tokens, which model(s) ran it, a tool-mix profile (`59 Edit · 58 Bash` reads as a build session; `15 WebSearch` as research), and an **API-equivalent cost estimate** (`~$23`) — notional if you're on a subscription plan, computed per message at published API rates, with 5-minute and 1-hour prompt-cache writes priced separately; MCP tools are folded to one `mcp:<server>` entry in the tool mix
 - **Press `f` to filter the list** to live sessions, or to those active in the last 24 hours or 7 days; a project stays listed while any of its sessions match, and its card shows only the matching ones
 - **Press Enter on an inactive session to resume it**: a new window opens in the terminal app you're currently using (Ghostty, iTerm2, or Terminal.app — detected automatically at launch), cd'd into the project, running `claude --resume`
 
