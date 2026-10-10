@@ -81,6 +81,11 @@ pub struct CustomAction {
 pub struct Config {
     pub watch_dir: PathBuf,
     pub claude_command: String,
+    // Which top-level tabs to show, in strip order, as the names written in
+    // the config (`git,claude,processes,network,disk`). None = every tab.
+    // The names are resolved against the platform's real tab list in
+    // main.rs, which drops unknown ones.
+    pub tabs: Option<Vec<String>>,
     pub custom_actions: Vec<CustomAction>,
 }
 
@@ -122,6 +127,9 @@ impl Config {
                 self.claude_command.replace(['\t', '\n'], " ").trim()
             ));
         }
+        if let Some(tabs) = &self.tabs {
+            out.push_str(&format!("tabs={}\n", tabs.join(",")));
+        }
         // Tab-separated because the config is line-based and tabs can't be
         // typed into the single-line editor — so path, name, and command are
         // free to contain anything else (spaces, `=`, quotes, …). The
@@ -155,6 +163,7 @@ impl Default for Config {
         Self {
             watch_dir: default_watch_dir(),
             claude_command: DEFAULT_CLAUDE_COMMAND.to_string(),
+            tabs: None,
             custom_actions: Vec::new(),
         }
     }
@@ -187,6 +196,16 @@ fn parse(text: &str) -> Config {
                 if let Some(cmd) = normalize_claude_command(value) {
                     cfg.claude_command = cmd;
                 }
+            }
+            // Comma-separated tab names. A list with nothing in it keeps
+            // the default (all tabs) rather than leaving an empty strip.
+            "tabs" => {
+                let names: Vec<String> = value
+                    .split(',')
+                    .map(|n| n.trim().to_lowercase())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                cfg.tabs = (!names.is_empty()).then_some(names);
             }
             // path \t name \t command [\t close] — a malformed line
             // (hand-edited config) is skipped rather than half-loaded.
@@ -269,6 +288,7 @@ mod tests {
         let cfg = Config {
             watch_dir: PathBuf::from("/tmp/code"),
             claude_command: "claudeandrew".to_string(),
+            tabs: None,
             custom_actions: vec![
                 CustomAction {
                     repo_path: PathBuf::from("/tmp/code/my app"),
@@ -321,6 +341,7 @@ mod tests {
         let cfg = Config {
             watch_dir: PathBuf::from("/tmp"),
             claude_command: DEFAULT_CLAUDE_COMMAND.to_string(),
+            tabs: None,
             custom_actions: vec![mk("/a", "one"), mk("/b", "two"), mk("/a", "three")],
         };
         let names: Vec<&str> = cfg
@@ -425,5 +446,23 @@ mod tests {
         assert_eq!(TerminalApp::Ghostty.label(), "Ghostty");
         assert_eq!(TerminalApp::Iterm2.label(), "iTerm2");
         assert_eq!(TerminalApp::TerminalApp.label(), "Terminal.app");
+    }
+
+    #[test]
+    fn tabs_round_trip_and_default_to_all() {
+        // Absent key: every tab, and nothing written back.
+        let cfg = parse("watch_dir=/tmp\n");
+        assert_eq!(cfg.tabs, None);
+        assert!(!cfg.serialize().contains("tabs="));
+        // Names are trimmed and lowercased, order kept.
+        let cfg = parse("tabs= Git , CLAUDE,,processes\n");
+        assert_eq!(
+            cfg.tabs,
+            Some(vec!["git".to_string(), "claude".to_string(), "processes".to_string()])
+        );
+        assert!(cfg.serialize().contains("tabs=git,claude,processes\n"));
+        // An empty list isn't an empty strip.
+        assert_eq!(parse("tabs=\n").tabs, None);
+        assert_eq!(parse("tabs= , ,\n").tabs, None);
     }
 }

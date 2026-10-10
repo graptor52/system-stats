@@ -35,7 +35,7 @@ enum Focus {
     Right,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     GitStatus,
     Processes,
@@ -47,9 +47,6 @@ enum Tab {
 #[cfg(target_os = "macos")]
 const TABS: [Tab; 5] =
     [Tab::GitStatus, Tab::Claude, Tab::Processes, Tab::Network, Tab::DiskPower];
-#[cfg(target_os = "macos")]
-const TAB_LABELS: [&str; 5] =
-    ["Git Status", "Claude", "Processes", "Network", "Disk / Power"];
 // Per-app network attribution rides on nettop, which is Darwin-only, so
 // off macOS the Network tab would be a permanent "unavailable" screen —
 // drop it from the strip instead. Tab::Network and its draw/key code
@@ -57,14 +54,52 @@ const TAB_LABELS: [&str; 5] =
 #[cfg(not(target_os = "macos"))]
 const TABS: [Tab; 4] =
     [Tab::GitStatus, Tab::Claude, Tab::Processes, Tab::DiskPower];
-#[cfg(not(target_os = "macos"))]
-const TAB_LABELS: [&str; 4] =
-    ["Git Status", "Claude", "Processes", "Disk / Power"];
 
 impl Tab {
-    fn index(self) -> usize {
-        TABS.iter().position(|t| *t == self).unwrap_or(0)
+    fn label(self) -> &'static str {
+        match self {
+            Tab::GitStatus => "Git Status",
+            Tab::Claude => "Claude",
+            Tab::Processes => "Processes",
+            Tab::Network => "Network",
+            Tab::DiskPower => "Disk / Power",
+        }
     }
+
+    // The name a tab goes by in the `tabs=` config key.
+    fn from_config_name(name: &str) -> Option<Tab> {
+        match name {
+            "git" | "gitstatus" | "git-status" | "git_status" => Some(Tab::GitStatus),
+            "claude" => Some(Tab::Claude),
+            "processes" | "process" | "procs" => Some(Tab::Processes),
+            "network" | "net" => Some(Tab::Network),
+            "disk" | "power" | "disk/power" | "disk-power" | "diskpower" => {
+                Some(Tab::DiskPower)
+            }
+            _ => None,
+        }
+    }
+}
+
+// The tabs to show, from the config's `tabs=` list: the user's order, only
+// names that resolve to a tab this platform has, duplicates dropped. Falls
+// back to every tab when the key is absent or names none of them, so a typo
+// can't leave an empty strip.
+fn resolve_tabs(configured: &Option<Vec<String>>) -> Vec<Tab> {
+    let mut out: Vec<Tab> = Vec::new();
+    if let Some(names) = configured {
+        for n in names {
+            if let Some(t) = Tab::from_config_name(n) {
+                if TABS.contains(&t) && !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out = TABS.to_vec();
+    }
+    out
 }
 
 // Menus are a stack: hitting Esc on the tab bar pushes `Main`; picking
@@ -485,6 +520,8 @@ struct App {
     // Optional because `nettop` might fail to spawn (e.g. quarantined
     // binary, missing entitlement). We render a friendly error in that
     // case instead of crashing.
+    // Tabs shown in the strip, in order (see resolve_tabs). Fixed at launch.
+    tabs: Vec<Tab>,
     net_monitor: Option<Monitor>,
     net_state: NetworkState,
     // Selection in the network app list, by canonical app name — a name
@@ -499,13 +536,14 @@ struct App {
     net_scroll: Cell<u16>,
     // Processes tab — same trio as the network tab: name-keyed selection,
     // full-screen detail, draw-nudged scroll offset.
-    proc_monitor: processes::Monitor,
+    // Monitors only run when their tab is shown; a hidden tab costs nothing.
+    proc_monitor: Option<processes::Monitor>,
     proc_state: ProcessState,
     proc_selected: Option<String>,
     proc_detail: Option<String>,
     proc_scroll: Cell<u16>,
     // Disk/power tab — a pure dashboard, so state only, no selection.
-    hw_monitor: hardware::Monitor,
+    hw_monitor: Option<hardware::Monitor>,
     hw_state: HardwareState,
     // Claude tab — its own scanner (same wake/root pattern as the git
     // scanner) plus the familiar name-keyed selection / detail / scroll trio.
@@ -557,6 +595,12 @@ impl App {
         };
         let scanner = spawn_scanner(config.watch_dir.clone());
         let claude_scanner = claude::spawn_scanner(config.watch_dir.clone());
+        let tabs = resolve_tabs(&config.tabs);
+        let shows = |t: Tab| tabs.contains(&t);
+        let net_monitor = if shows(Tab::Network) { network::spawn_monitor() } else { None };
+        let proc_monitor = shows(Tab::Processes).then(processes::spawn_monitor);
+        let hw_monitor = shows(Tab::DiskPower).then(hardware::spawn_monitor);
+        let selected_tab = tabs[0];
         Self {
             scanner,
             config,
@@ -571,22 +615,23 @@ impl App {
             inspect_content_lines: Cell::new(0),
             inspect_inner_height: Cell::new(0),
             focus: Focus::Tabs,
-            selected_tab: Tab::GitStatus,
+            selected_tab,
+            tabs,
             left_scroll: 0,
             left_content_lines: Cell::new(0),
             left_inner_height: Cell::new(0),
             right_scroll: Cell::new(0),
-            net_monitor: network::spawn_monitor(),
+            net_monitor,
             net_state: NetworkState::new(),
             net_selected: None,
             net_detail: None,
             net_scroll: Cell::new(0),
-            proc_monitor: processes::spawn_monitor(),
+            proc_monitor,
             proc_state: ProcessState::new(),
             proc_selected: None,
             proc_detail: None,
             proc_scroll: Cell::new(0),
-            hw_monitor: hardware::spawn_monitor(),
+            hw_monitor,
             hw_state: HardwareState::new(),
             claude_scanner,
             claude_tree: None,
@@ -629,10 +674,9 @@ impl App {
     }
 
     fn drain_process_updates(&mut self) {
-        loop {
-            match self.proc_monitor.try_recv() {
-                Ok(sample) => self.proc_state.apply_sample(sample),
-                Err(_) => break,
+        if let Some(mon) = &self.proc_monitor {
+            while let Ok(sample) = mon.try_recv() {
+                self.proc_state.apply_sample(sample);
             }
         }
         // An app whose processes all exited can't stay selected or detailed.
@@ -649,7 +693,8 @@ impl App {
     }
 
     fn drain_hardware_updates(&mut self) {
-        while let Ok(sample) = self.hw_monitor.try_recv() {
+        let Some(mon) = &self.hw_monitor else { return };
+        while let Ok(sample) = mon.try_recv() {
             self.hw_state.apply_sample(sample);
         }
     }
@@ -802,6 +847,11 @@ impl App {
         self.left_scroll = next as u16;
     }
 
+    // Position of the selected tab in the visible strip.
+    fn tab_index(&self) -> usize {
+        self.tabs.iter().position(|t| *t == self.selected_tab).unwrap_or(0)
+    }
+
     fn set_tab(&mut self, tab: Tab) {
         self.selected_tab = tab;
         // The Claude scanner runs twice as fast while its tab is showing.
@@ -809,10 +859,10 @@ impl App {
     }
 
     fn cycle_tab(&mut self, delta: i32) {
-        let n = TABS.len() as i32;
-        let cur = self.selected_tab.index() as i32;
+        let n = self.tabs.len() as i32;
+        let cur = self.tab_index() as i32;
         let next = (cur + delta).clamp(0, n - 1) as usize;
-        self.set_tab(TABS[next]);
+        self.set_tab(self.tabs[next]);
     }
 
     // The direction Tab/Shift-Tab asks for, or None for any other key.
@@ -832,9 +882,9 @@ impl App {
     // tears down whatever drill-down state the old tab was holding, so
     // the new tab always opens at its top level with the bar focused.
     fn switch_tab(&mut self, delta: i32) {
-        let n = TABS.len() as i32;
-        let next = (self.selected_tab.index() as i32 + delta).rem_euclid(n) as usize;
-        self.set_tab(TABS[next]);
+        let n = self.tabs.len() as i32;
+        let next = (self.tab_index() as i32 + delta).rem_euclid(n) as usize;
+        self.set_tab(self.tabs[next]);
         self.reset_tab_state();
     }
 
@@ -879,7 +929,9 @@ impl App {
         if self.dir_prompt.as_ref().is_some_and(|p| p.can_cancel) {
             self.dir_prompt = None;
         }
-        self.set_tab(Tab::GitStatus);
+        // Home is the first tab in the strip (Git Status unless the config
+        // reorders or hides it).
+        self.set_tab(self.tabs[0]);
         self.reset_tab_state();
     }
 
@@ -2431,9 +2483,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let highlight_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let titles: Vec<Line> = TAB_LABELS
+    let titles: Vec<Line> = app
+        .tabs
         .iter()
-        .map(|s| Line::from(Span::raw(*s)))
+        .map(|t| Line::from(Span::raw(t.label())))
         .collect();
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -2443,7 +2496,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     // using. Truncated to what's left after the labels so a long message
     // can't shove them off a narrow terminal.
     if let Some(notice) = &app.notice {
-        let labels: usize = TAB_LABELS.iter().map(|s| s.chars().count() + 3).sum();
+        let labels: usize = app.tabs.iter().map(|t| t.label().chars().count() + 3).sum();
         let room = (area.width as usize).saturating_sub(labels + 4);
         if room > 8 {
             block = block.title_top(
@@ -2456,7 +2509,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let tabs = Tabs::new(titles)
-        .select(app.selected_tab.index())
+        .select(app.tab_index())
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(highlight_style)
         .divider(Span::styled("│", Style::default().fg(Color::DarkGray)))
@@ -5787,11 +5840,24 @@ mod tests {
     // -------------------- tab cycling --------------------
 
     #[test]
-    fn tab_indexes_match_the_strip_order() {
-        for (i, tab) in TABS.iter().enumerate() {
-            assert_eq!(tab.index(), i);
+    fn every_platform_tab_has_a_label_and_a_config_name() {
+        for tab in TABS {
+            assert!(!tab.label().is_empty());
         }
-        assert_eq!(TABS.len(), TAB_LABELS.len());
+        assert_eq!(Tab::from_config_name("disk"), Some(Tab::DiskPower));
+        assert_eq!(Tab::from_config_name("nope"), None);
+    }
+
+    #[test]
+    fn configured_tabs_keep_order_and_drop_unknown_or_duplicate_names() {
+        let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            resolve_tabs(&names(&["claude", "git", "bogus", "claude"])),
+            vec![Tab::Claude, Tab::GitStatus]
+        );
+        // Nothing usable (or nothing configured) means every tab.
+        assert_eq!(resolve_tabs(&names(&["bogus"])), TABS.to_vec());
+        assert_eq!(resolve_tabs(&None), TABS.to_vec());
     }
 
     #[test]

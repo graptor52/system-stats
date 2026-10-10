@@ -84,11 +84,14 @@ A single, human-editable file at `~/.config/system-stats/config` (or `$XDG_CONFI
 # system-stats config
 watch_dir=/Users/you/Documents/code
 claude_command=claude
+tabs=git,claude
 ```
 
 Change them from inside the app via `Esc → Settings`, or edit the file directly.
 
 `claude_command` is what gets typed into the new terminal when the app starts or resumes a Claude session (from the Claude tab, or the repo menu's Claude action). It defaults to `claude` and is omitted from the file in that case. Point it at a wrapper that accepts the same arguments — for example one that parks the session on a hub so it can be attached from a browser or phone — and every session the app launches goes through it. The text is typed verbatim into a login shell in front of `--resume <id>`, so a bare name resolves through your PATH and flags are allowed (`claude --model opus`). A blank value falls back to `claude`.
+
+`tabs` picks which tabs appear, and in what order: any of `git`, `claude`, `processes`, `network`, `disk`. Omit it for all of them. Hidden tabs don't run their background monitors, so leaving out Processes, Network, or Disk / Power also saves their polling. Unknown names are ignored, and a list with no valid names shows every tab. It's read at launch — restart to apply a change.
 
 The terminal app used for resuming Claude sessions is *not* configured — it's detected from `TERM_PROGRAM` at every launch, so it follows you between terminal apps (falling back to Terminal.app under tmux or editor-embedded terminals).
 
