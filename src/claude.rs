@@ -184,14 +184,20 @@ struct CacheEntry {
 struct MsgUsage {
     input: u64,
     output: u64,
+    // All cache-creation tokens (5-minute and 1-hour TTL together).
     cache_write: u64,
+    // The subset of `cache_write` written with the 1-hour TTL, which bills
+    // at 2 × input rather than 1.25 ×. Zero when the usage block carries no
+    // TTL breakdown, in which case everything prices as 5-minute.
+    cache_write_1h: u64,
     cache_read: u64,
 }
 
 // API pricing in USD per million tokens (input, output), matched by model-id
 // prefix so new versions within a family inherit their tier's rates. Cache
-// writes bill at 1.25 × input (5-minute TTL assumed — 1-hour writes are 2×,
-// so this can slightly underestimate) and cache reads at 0.1 × input.
+// writes bill at 1.25 × input for the 5-minute TTL and 2 × input for the
+// 1-hour TTL (split out via usage.cache_creation), and cache reads at
+// 0.1 × input.
 // Prices change occasionally; update alongside Anthropic's published
 // pricing. Cached 2026-07.
 const MODEL_RATES: [(&str, f64, f64); 5] = [
@@ -214,9 +220,12 @@ fn model_rates(model: &str) -> (f64, f64) {
 
 fn usage_cost(model: &str, u: &MsgUsage) -> f64 {
     let (input_rate, output_rate) = model_rates(model);
+    let write_1h = u.cache_write_1h.min(u.cache_write);
+    let write_5m = u.cache_write - write_1h;
     (u.input as f64 * input_rate
         + u.output as f64 * output_rate
-        + u.cache_write as f64 * input_rate * 1.25
+        + write_5m as f64 * input_rate * 1.25
+        + write_1h as f64 * input_rate * 2.0
         + u.cache_read as f64 * input_rate * 0.10)
         / 1e6
 }
@@ -874,6 +883,8 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
                     output: json_u64(line, "output_tokens").unwrap_or(0),
                     cache_write: json_u64(line, "cache_creation_input_tokens")
                         .unwrap_or(0),
+                    cache_write_1h: json_u64(line, "ephemeral_1h_input_tokens")
+                        .unwrap_or(0),
                     cache_read: json_u64(line, "cache_read_input_tokens")
                         .unwrap_or(0),
                 };
@@ -1459,15 +1470,48 @@ mod tests {
 
     #[test]
     fn cache_tokens_bill_at_their_own_multiples_of_input() {
-        let u = MsgUsage { input: 0, output: 0, cache_write: 1_000_000, cache_read: 0 };
+        let u = MsgUsage { cache_write: 1_000_000, ..MsgUsage::default() };
         // Writes are 1.25 × input rate; sonnet input is $3/M.
         assert!((usage_cost("claude-sonnet-5", &u) - 3.75).abs() < 1e-9);
-        let u = MsgUsage { input: 0, output: 0, cache_write: 0, cache_read: 1_000_000 };
+        let u = MsgUsage { cache_read: 1_000_000, ..MsgUsage::default() };
         // Reads are 0.10 × input rate.
         assert!((usage_cost("claude-sonnet-5", &u) - 0.30).abs() < 1e-9);
-        let u = MsgUsage { input: 1_000_000, output: 1_000_000, cache_write: 0, cache_read: 0 };
+        let u = MsgUsage { input: 1_000_000, output: 1_000_000, ..MsgUsage::default() };
         assert!((usage_cost("claude-sonnet-5", &u) - 18.0).abs() < 1e-9);
         // No usage, no cost.
         assert_eq!(usage_cost("claude-opus-5", &MsgUsage::default()), 0.0);
+    }
+
+    #[test]
+    fn one_hour_cache_writes_bill_at_double_input() {
+        // 1M written, all at the 1h TTL: 2 × $3 = $6.
+        let u = MsgUsage {
+            cache_write: 1_000_000,
+            cache_write_1h: 1_000_000,
+            ..MsgUsage::default()
+        };
+        assert!((usage_cost("claude-sonnet-5", &u) - 6.0).abs() < 1e-9);
+        // Half and half: 0.5M × 1.25 × $3 + 0.5M × 2 × $3 = $4.875.
+        let u = MsgUsage {
+            cache_write: 1_000_000,
+            cache_write_1h: 500_000,
+            ..MsgUsage::default()
+        };
+        assert!((usage_cost("claude-sonnet-5", &u) - 4.875).abs() < 1e-9);
+        // A 1h figure larger than the total can't go negative.
+        let u = MsgUsage {
+            cache_write: 100,
+            cache_write_1h: 5_000,
+            ..MsgUsage::default()
+        };
+        assert!(usage_cost("claude-sonnet-5", &u) > 0.0);
+    }
+
+    #[test]
+    fn parser_reads_the_cache_ttl_split_from_usage() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_01TTL","role":"assistant","content":[],"usage":{"input_tokens":3,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":1000000,"ephemeral_5m_input_tokens":0}}},"timestamp":"2026-10-01T00:00:00.000Z"}"#;
+        let p = parse_transcript_text(line);
+        // 3 in × $5 + 1M 1h-write × 2 × $5 = $10.000015
+        assert!((p.cost_usd - 10.000015).abs() < 1e-9, "got {}", p.cost_usd);
     }
 }
