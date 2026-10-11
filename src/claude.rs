@@ -588,6 +588,9 @@ fn project_label(dir: &Path, root: &Path, store: &Path) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
     }
+    if let Some(label) = desktop_scratch_label(dir) {
+        return label;
+    }
     let shown = config::display_path(dir);
     if shown.chars().count() <= 40 {
         return shown;
@@ -595,6 +598,26 @@ fn project_label(dir: &Path, root: &Path, store: &Path) -> String {
     let parts: Vec<_> = dir.components().rev().take(2).collect();
     let tail: PathBuf = parts.into_iter().rev().collect();
     format!("…/{}", tail.display())
+}
+
+// The desktop app runs sessions in throwaway folders like
+// `…/Claude/scratch-workspaces/<uuid>/<uuid>/scratch-2026-10-09-60e5ec`.
+// "Claude desktop · 2026-10-09 (60e5ec)" reads better than that path.
+fn desktop_scratch_label(dir: &Path) -> Option<String> {
+    let in_scratch = dir
+        .components()
+        .any(|c| c.as_os_str() == "scratch-workspaces");
+    if !in_scratch {
+        return None;
+    }
+    let leaf = dir.file_name()?.to_string_lossy();
+    let rest = leaf.strip_prefix("scratch-")?;
+    match rest.split_once('-').and_then(|_| rest.get(..10)) {
+        Some(date) if rest.len() > 11 && rest.is_char_boundary(11) => {
+            Some(format!("Claude desktop · {date} ({})", &rest[11..]))
+        }
+        _ => Some(format!("Claude desktop · {rest}")),
+    }
 }
 
 fn claude_dir() -> Option<PathBuf> {
@@ -1894,6 +1917,22 @@ mod tests {
         assert_eq!(project_label(Path::new("/opt/app"), root, store), "/opt/app");
         // No known directory: fall back to the store's own name.
         assert_eq!(project_label(Path::new(""), root, store), "-x");
+    }
+
+    #[test]
+    fn desktop_scratch_workspaces_get_a_friendly_label() {
+        let root = Path::new("/Users/me/code");
+        let store = Path::new("/h/.claude/projects/-x");
+        let dir = Path::new(
+            "/Users/me/Library/Application Support/Claude/scratch-workspaces/f633/a101/scratch-2026-10-09-60e5ec",
+        );
+        assert_eq!(
+            project_label(dir, root, store),
+            "Claude desktop · 2026-10-09 (60e5ec)"
+        );
+        // Unexpected leaf names still get the prefix, not the long path.
+        let odd = Path::new("/x/scratch-workspaces/a/b/scratch-misc");
+        assert_eq!(project_label(odd, root, store), "Claude desktop · misc");
     }
 
     #[test]
